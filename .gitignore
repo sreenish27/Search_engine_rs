@@ -1,3 +1,5 @@
 20news-bydate/
 index.json
 target/
+.DS_Store
+docmap.json
