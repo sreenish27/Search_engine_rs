@@ -5,7 +5,7 @@ use std::io;
 use std::time::Instant;
 
 fn main() {
-    let root = "/Users/krithik-qfit/Desktop/hello_world/hello_cargo/20news-bydate/20news-bydate-train";
+    let root = "/Users/krithik-qfit/Desktop/Search_engine/hello_cargo/20news-bydate/20news-bydate-train";
     let mut index_map: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
     let mut doc_id: u32 = 0;
     let mut doc_map: HashMap<u32, String> = HashMap::new();
@@ -23,6 +23,11 @@ fn main() {
     let mut file = File::create("index.json").unwrap();
     file.write_all(json.as_bytes()).unwrap();
 
+    //docmap store as well
+    let json = serde_json::to_string_pretty(&doc_map).unwrap();
+    let mut file = File::create("docmap.json").unwrap();
+    file.write_all(json.as_bytes()).unwrap();
+
     //make user give a search query and give docIDs which match
     //accept user query
     let mut query:String = String::new();
@@ -33,8 +38,9 @@ fn main() {
 
     let query_list: Vec<String> = query.split_whitespace().map(|w| w.to_string()).collect();
 
-    let term_list = docid_list(query_list, &sorted_docs);
+    let term_list = docid_list(&query_list, &sorted_docs);
     let results = intersect_all(term_list);
+    let results = phrase_filter(results, &query_list, &index_map);
 
     println!("{:?}", results);
     let duration = start.elapsed();
@@ -82,11 +88,11 @@ fn split_string(content: String) -> Vec<String> {
 }
 
 //a function which gets the list of docIDs to intersect
-fn docid_list(term_list: Vec<String>, sorted_docs: &HashMap<String, Vec<u32>>) -> Vec<Vec<u32>> {
+fn docid_list(term_list: &Vec<String>, sorted_docs: &HashMap<String, Vec<u32>>) -> Vec<Vec<u32>> {
     let mut temp_list: Vec<Vec<u32>> = Vec::new();
     //get the docids and positional index list
     for term in term_list {
-        let doc_ids = sorted_docs.get(&term);
+        let doc_ids = sorted_docs.get(term);
         if doc_ids.is_none() {
             return Vec::new();
         }
@@ -135,4 +141,38 @@ fn intersect_two(list1: &Vec<u32>, list2:&Vec<u32>) -> Vec<u32> {
     }
 
     intersect_list
+}
+
+// checks if a phrase exists in a document by verifying consecutive positions
+fn has_phrase(doc_id: u32, query_terms: &Vec<String>, index_map: &HashMap<String, HashMap<u32, Vec<u32>>>) -> bool {
+    // get position list for the first term
+    let first_positions = index_map.get(&query_terms[0]).unwrap().get(&doc_id).unwrap();
+
+    // for each starting position of the first term
+    for &p in first_positions {
+        let mut found = true;
+        // check if every subsequent term exists at p+1, p+2, p+3...
+        for (offset, term) in query_terms.iter().enumerate().skip(1) {
+            let term_positions = index_map.get(term).unwrap().get(&doc_id).unwrap();
+            if term_positions.binary_search(&(p + offset as u32)).is_err() {
+                found = false;
+                break;
+            }
+        }
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+// filters the doc list to only docs containing the exact phrase
+fn phrase_filter(final_list: Vec<u32>, query_terms: &Vec<String>, index_map: &HashMap<String, HashMap<u32, Vec<u32>>>) -> Vec<u32> {
+    let mut phrase_results: Vec<u32> = Vec::new();
+    for doc_id in final_list {
+        if has_phrase(doc_id, query_terms, index_map) {
+            phrase_results.push(doc_id);
+        }
+    }
+    phrase_results
 }
