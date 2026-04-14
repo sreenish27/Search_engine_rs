@@ -1,93 +1,108 @@
 use std::{collections::HashMap, fs};
-// use std::fs::File;
-// use std::io::Write;
+use std::fs::File;
+use std::io::Write;
 use std::io;
 use std::time::Instant;
 use std::collections::{BTreeMap, HashSet};
 
+use std::io::{Seek, SeekFrom, Read};
+
 fn main() {
+    let total_start = Instant::now();
     let root = "/Users/krithik-qfit/Desktop/Search_engine/hello_cargo/20news-bydate/20news-bydate-train";
     let mut index_map: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
     let mut doc_id: u32 = 0;
     let mut doc_map: HashMap<u32, String> = HashMap::new();
-    //3-gram index to take care of wildcard queries
     let mut gram_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    println!("--- INDEX CONSTRUCTION ---");
+    let t = Instant::now();
     traverse(root, &mut index_map, &mut doc_id, &mut doc_map, &mut gram_index);
-    //my inverted index hashmap
-    // println!("{:?}", index_map);
-    // println!("{:?}", doc_map);
-    let mut sorted_docs: HashMap<String, Vec<u32>> = HashMap::new();
-    for (term, doc_hash) in &index_map {
-        let mut keys: Vec<u32> = doc_hash.keys().cloned().collect();
-        keys.sort();
-        sorted_docs.insert(term.clone(), keys);
-}
-    // let json = serde_json::to_string_pretty(&index_map).unwrap();
-    // let mut file = File::create("index.json").unwrap();
-    // file.write_all(json.as_bytes()).unwrap();
+    if !index_map.is_empty() {
+        let encoded = bincode::serialize(&index_map).unwrap();
+        let block_num = (doc_id / 4000) + 1;
+        let filename = format!("block_{}.bin", block_num);
+        let mut file = File::create(&filename).unwrap();
+        file.write_all(&encoded).unwrap();
+        index_map.clear();
+    }
+    println!("  Documents processed: {}", doc_id);
+    println!("  Unique trigrams in gram index: {}", gram_index.len());
+    println!("  Index construction time: {:?}", t.elapsed());
 
-    // //docmap store as well
-    // let json = serde_json::to_string_pretty(&doc_map).unwrap();
-    // let mut file = File::create("docmap.json").unwrap();
-    // file.write_all(json.as_bytes()).unwrap();
+    println!("--- MERGING BLOCKS ---");
+    let t = Instant::now();
+    let term_index = merge_index_map();
+    println!("  Terms in final index: {}", term_index.len());
+    println!("  Merge time: {:?}", t.elapsed());
 
-    // //k-gram BTree store as well
-    // let json = serde_json::to_string_pretty(&gram_index).unwrap();
-    // let mut file = File::create("gramindex.json").unwrap();
-    // file.write_all(json.as_bytes()).unwrap();
+    println!("--- READY FOR QUERIES ---");
+    println!("  Total setup time: {:?}", total_start.elapsed());
 
-    //make user give a search query and give docIDs which match
-    //accept user query
-    let mut query:String = String::new();
-    println!("{}", "Enter your search query:");
+    let mut query: String = String::new();
+    println!("\nEnter your search query:");
     io::stdin().read_line(&mut query).unwrap();
     let start = Instant::now();
     let query = query.trim().to_lowercase().to_string();
 
     let mut query_list: Vec<String> = query.split_whitespace().map(|w| w.to_string()).collect();
 
-    //run my spell checker algorithm - using K-gram before passing final stuff to search engine
+    println!("--- SPELL CHECKING ---");
+    let t = Instant::now();
     for i in 0..query_list.len() {
-        if !sorted_docs.contains_key(&query_list[i]) {
+        if !term_index.contains_key(&query_list[i]) {
             let suggestions = spell_corrector(&query_list[i], &gram_index);
             if !suggestions.is_empty() {
                 query_list[i] = suggestions[0].clone();
             }
         }
     }
-    
     let corrected_query: String = query_list.join(" ");
-    println!("Did you mean: \x1b[3m{}\x1b[0m?", corrected_query);
+    println!("  Did you mean: \x1b[3m{}\x1b[0m?", corrected_query);
+    println!("  Spell check time: {:?}", t.elapsed());
 
-    let term_list = docid_list(&query_list, &sorted_docs);
+    println!("--- RETRIEVING POSTINGS ---");
+    let t = Instant::now();
+    let term_list = docid_list(&query_list, &term_index);
+    println!("  Postings retrieval time: {:?}", t.elapsed());
+
+    println!("--- INTERSECTING ---");
+    let t = Instant::now();
     let results = intersect_all(term_list);
-    let results = phrase_filter(results, &query_list, &index_map);
+    println!("  Documents after intersection: {}", results.len());
+    println!("  Intersection time: {:?}", t.elapsed());
 
+    println!("--- PHRASE FILTERING ---");
+    let t = Instant::now();
+    let results = phrase_filter(results, &query_list, &term_index);
+    println!("  Documents after phrase filter: {}", results.len());
+    println!("  Phrase filter time: {:?}", t.elapsed());
+
+    println!("--- RESULTS ---");
     println!("{:?}", results);
     let duration = start.elapsed();
-    println!("Search took: {:?}", duration);
-
+    println!("Total search time: {:?}", duration);
 }
 
-//recrusively traverses through a folder to get to all the files 
-//- gets each files path and prints the file path and file contents
-fn traverse(path:&str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>, doc_id: &mut u32, doc_map: &mut HashMap<u32, String>, gram_index: &mut BTreeMap<String, Vec<String>>) {
+fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>, doc_id: &mut u32, doc_map: &mut HashMap<u32, String>, gram_index: &mut BTreeMap<String, Vec<String>>) {
     let entries = fs::read_dir(path).unwrap();
-    //the inverted document index hashmap
-    //for document ID
     for entry in entries {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_dir() {
             traverse(entry.path().to_str().unwrap(), index_map, doc_id, doc_map, gram_index);
-        }
-        else {
+        } else {
+            if *doc_id > 0 && *doc_id % 4000 == 0 {
+                println!("  Writing block {} to disk, clearing memory", *doc_id / 4000);
+                let encoded = bincode::serialize(&index_map).unwrap();
+                let filename = format!("block_{}.bin", *doc_id / 4000);
+                let mut file = File::create(&filename).unwrap();
+                file.write_all(&encoded).unwrap();
+                index_map.clear();
+            }
             *doc_id += 1;
-            //creating a map for docIDs and location of the files
             doc_map.insert(*doc_id, entry.path().to_str().unwrap().to_string());
             let file_content = read_contents(entry.path().to_str().unwrap());
-            // println!("{:?}",split_string(file_content));
             let terms: Vec<String> = split_string(file_content);
-            //code block to create the inverted index and also positional index code
             for (pos, term) in terms.iter().enumerate() {
                 if !index_map.contains_key(term) {
                     three_gram_index(term, gram_index);
@@ -98,41 +113,45 @@ fn traverse(path:&str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>, 
     }
 }
 
-//accepts a file path - reads the bytes - checks for UTF-8 replaces where it is not turns is into string and returns it
-fn read_contents (file_path:&str) -> String {
+fn read_contents(file_path: &str) -> String {
     let content = fs::read(file_path).unwrap();
-    let text = String::from_utf8_lossy(&content).to_string();
-    text
+    String::from_utf8_lossy(&content).to_string()
 }
 
-//a function to take a document and split all terms and make a list - also cleans up to include only alphanumeric and moves everything to lowercase
 fn split_string(content: String) -> Vec<String> {
-    let content_list = content.split_whitespace().map(|word| word.to_string().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()).collect();
-    content_list
+    content.split_whitespace().map(|word| word.to_string().to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()).collect()
 }
 
-//a function which gets the list of docIDs to intersect
-fn docid_list(term_list: &Vec<String>, sorted_docs: &HashMap<String, Vec<u32>>) -> Vec<Vec<u32>> {
-    let mut temp_list: Vec<Vec<u32>> = Vec::new();
-    //get the docids and positional index list
+fn docid_list(term_list: &Vec<String>, term_index: &HashMap<String, (u64, u64, u32)>) -> Vec<Vec<u32>> {
+    let mut term_meta: Vec<(&String, u64, u64, u32)> = Vec::new();
     for term in term_list {
-        let doc_ids = sorted_docs.get(term);
-        if doc_ids.is_none() {
-            return Vec::new();
+        if let Some(meta_data) = term_index.get(term) {
+            term_meta.push((term, meta_data.0, meta_data.1, meta_data.2));
         }
-        temp_list.push(doc_ids.unwrap().clone());
     }
-    //sort based on length of docids for each term
-    temp_list.sort_by_key(|list| list.len());
+    term_meta.sort_by_key(|t| t.3);
 
-    temp_list
+    println!("  Reading {} posting lists from disk", term_meta.len());
+    let mut file = File::open("final_index.bin").unwrap();
+    let mut posting_lists: Vec<Vec<u32>> = Vec::new();
+
+    for (term, offset, length, doc_freq) in &term_meta {
+        file.seek(SeekFrom::Start(*offset)).unwrap();
+        let mut buffer = vec![0u8; *length as usize];
+        file.read_exact(&mut buffer).unwrap();
+        let postings: HashMap<u32, Vec<u32>> = bincode::deserialize(&buffer).unwrap();
+        let mut doc_ids: Vec<u32> = postings.keys().cloned().collect();
+        doc_ids.sort();
+        println!("    '{}': {} docs (read {} bytes from offset {})", term, doc_ids.len(), length, offset);
+        posting_lists.push(doc_ids);
+    }
+
+    posting_lists
 }
 
-//a function which intersects between all word docID lists and gives final relevant documents
 fn intersect_all(doc_id_list: Vec<Vec<u32>>) -> Vec<u32> {
-    //a check to handle if the doclist is empty
-    if doc_id_list.is_empty(){
-        return Vec::new();
+    if doc_id_list.is_empty() {
+        return vec![];
     }
     let mut final_list: Vec<u32> = doc_id_list[0].clone();
     let mut i: usize = 1;
@@ -140,44 +159,33 @@ fn intersect_all(doc_id_list: Vec<Vec<u32>>) -> Vec<u32> {
         final_list = intersect_two(&final_list, &doc_id_list[i]);
         i += 1;
     }
-
     final_list
 }
 
-//a function to just intersect 2 lists
-fn intersect_two(list1: &Vec<u32>, list2:&Vec<u32>) -> Vec<u32> {
-    let mut intersect_list:Vec<u32> = Vec::new();
-    let mut i:usize = 0;
-    let mut j:usize = 0;
-
+fn intersect_two(list1: &Vec<u32>, list2: &Vec<u32>) -> Vec<u32> {
+    let mut intersect_list: Vec<u32> = Vec::new();
+    let mut i: usize = 0;
+    let mut j: usize = 0;
     while i < list1.len() && j < list2.len() {
         if list1[i] == list2[j] {
             intersect_list.push(list1[i]);
             i += 1;
             j += 1;
-        }
-        else if list1[i] < list2[j] {
+        } else if list1[i] < list2[j] {
             i += 1;
-        }
-        else {
+        } else {
             j += 1;
         }
     }
-
     intersect_list
 }
 
-// checks if a phrase exists in a document by verifying consecutive positions
-fn has_phrase(doc_id: u32, query_terms: &Vec<String>, index_map: &HashMap<String, HashMap<u32, Vec<u32>>>) -> bool {
-    // get position list for the first term
-    let first_positions = index_map.get(&query_terms[0]).unwrap().get(&doc_id).unwrap();
-
-    // for each starting position of the first term
+fn has_phrase(doc_id: u32, query_terms: &Vec<String>, all_postings: &Vec<HashMap<u32, Vec<u32>>>) -> bool {
+    let first_positions = all_postings[0].get(&doc_id).unwrap();
     for &p in first_positions {
         let mut found = true;
-        // check if every subsequent term exists at p+1, p+2, p+3...
-        for (offset, term) in query_terms.iter().enumerate().skip(1) {
-            let term_positions = index_map.get(term).unwrap().get(&doc_id).unwrap();
+        for (offset, _) in query_terms.iter().enumerate().skip(1) {
+            let term_positions = all_postings[offset].get(&doc_id).unwrap();
             if term_positions.binary_search(&(p + offset as u32)).is_err() {
                 found = false;
                 break;
@@ -190,11 +198,15 @@ fn has_phrase(doc_id: u32, query_terms: &Vec<String>, index_map: &HashMap<String
     false
 }
 
-// filters the doc list to only docs containing the exact phrase
-fn phrase_filter(final_list: Vec<u32>, query_terms: &Vec<String>, index_map: &HashMap<String, HashMap<u32, Vec<u32>>>) -> Vec<u32> {
+fn phrase_filter(final_list: Vec<u32>, query_terms: &Vec<String>, term_index: &HashMap<String, (u64, u64, u32)>) -> Vec<u32> {
+    let mut all_postings: Vec<HashMap<u32, Vec<u32>>> = Vec::new();
+    for term in query_terms {
+        all_postings.push(read_postings(term, term_index).unwrap());
+    }
+    println!("  Phrase filtering {} candidates", final_list.len());
     let mut phrase_results: Vec<u32> = Vec::new();
     for doc_id in final_list {
-        if has_phrase(doc_id, query_terms, index_map) {
+        if has_phrase(doc_id, query_terms, &all_postings) {
             phrase_results.push(doc_id);
         }
     }
@@ -205,7 +217,7 @@ fn three_gram_index(term: &str, gram_index: &mut BTreeMap<String, Vec<String>>) 
     let padded = format!("${}$", term);
     let mut i: usize = 0;
     while i < padded.len() - 2 {
-        let gram = padded[i..i+3].to_string();
+        let gram = padded[i..i + 3].to_string();
         let term_list = gram_index.entry(gram).or_insert(Vec::new());
         if !term_list.contains(&term.to_string()) {
             term_list.push(term.to_string());
@@ -214,24 +226,21 @@ fn three_gram_index(term: &str, gram_index: &mut BTreeMap<String, Vec<String>>) 
     }
 }
 
-//implemnting my spell correction function - leverages trigram index to get possible words
 fn spell_corrector(term: &str, tri_gram_index: &BTreeMap<String, Vec<String>>) -> Vec<String> {
-    //break the term into trigrams and put it in a list
-    let mut trigram_list:Vec<String> = Vec::new();
+    let mut trigram_list: Vec<String> = Vec::new();
     let mut i: usize = 0;
     let padded: String = format!("${}$", term);
     while i < padded.len() - 2 {
-        trigram_list.push(padded[i..i+3].to_string());
+        trigram_list.push(padded[i..i + 3].to_string());
         i += 1;
     }
-    //now get the trigrams list of terms from trigram_index and store it in a list of lists
     let mut all_terms: HashSet<String> = HashSet::new();
     for trigram in &trigram_list {
         if let Some(terms) = tri_gram_index.get(trigram) {
             all_terms.extend(terms.iter().cloned());
         }
     }
-    //now get the final candidates based on jaccard distance
+    println!("  Spell check: '{}' → {} raw candidates from trigram index", term, all_terms.len());
     let mut candidates: Vec<(String, f64)> = Vec::new();
     for candidate in &all_terms {
         let score: f64 = jaccard_distance(term, candidate);
@@ -240,20 +249,18 @@ fn spell_corrector(term: &str, tri_gram_index: &BTreeMap<String, Vec<String>>) -
         }
     }
     candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    //now check for edit distance for these terms and then - finally get the possible terms
+    println!("  Spell check: '{}' → {} after Jaccard filter", term, candidates.len());
     let mut possible_list: Vec<(String, usize)> = Vec::new();
-    for (candidate, score) in candidates.iter() {
-        let e_distance:usize = edit_distance(term, candidate);
-        if e_distance < term.len()/3 {
+    for (candidate, _score) in candidates.iter() {
+        let e_distance: usize = edit_distance(term, candidate);
+        if e_distance < term.len() / 3 {
             possible_list.push((candidate.clone(), e_distance));
         }
     }
-
     possible_list.sort_by_key(|a| a.1);
+    println!("  Spell check: '{}' → {} after edit distance filter", term, possible_list.len());
     let final_list: Vec<String> = possible_list.iter().map(|(term, _)| term.clone()).collect();
-
     final_list
-
 }
 
 fn jaccard_distance(term1: &str, term2: &str) -> f64 {
@@ -269,7 +276,7 @@ fn three_gram_set(term: &str) -> HashSet<String> {
     let padded = format!("${}$", term);
     let mut i: usize = 0;
     while i < padded.len() - 2 {
-        grams.insert(padded[i..i+3].to_string());
+        grams.insert(padded[i..i + 3].to_string());
         i += 1;
     }
     grams
@@ -279,7 +286,6 @@ fn edit_distance(term1: &str, term2: &str) -> usize {
     let a: Vec<char> = term1.chars().collect();
     let b: Vec<char> = term2.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
-
     for i in 1..=a.len() {
         let mut curr = vec![i; b.len() + 1];
         for j in 1..=b.len() {
@@ -294,37 +300,61 @@ fn edit_distance(term1: &str, term2: &str) -> usize {
     prev[b.len()]
 }
 
-// //a function to just intersect 2 lists - also implement skip pointers within - to reduce no. of operations being done
-// fn intersect_two(list1: &Vec<u32>, list2:&Vec<u32>) -> Vec<u32> {
-//     let mut intersect_list:Vec<u32> = Vec::new();
-//     let l1_inc: usize = (list1.len() as f64).sqrt() as usize;
-//     let l2_inc: usize = (list2.len() as f64).sqrt() as usize;
-//     let mut i:usize = 0;
-//     let mut j:usize = 0;
+fn merge_index_map() -> HashMap<String, (u64, u64, u32)> {
+    let num_blocks = fs::read_dir(".")
+        .unwrap()
+        .filter(|f| f.as_ref().unwrap().file_name().to_str().unwrap().starts_with("block_"))
+        .count();
+    println!("  Blocks found: {}", num_blocks);
 
-//     while i < list1.len() && j < list2.len() {
-//         if list1[i] == list2[j] {
-//             intersect_list.push(list1[i]);
-//             i += 1;
-//             j += 1;
-//         }
-//         else if list1[i] < list2[j] {
-//             if i+l1_inc < list1.len() && list1[i+l1_inc] <= list2[j] {
-//                 i += l1_inc;
-//             }
-//             else {
-//                 i += 1;
-//             }           
-//         }
-//         else {
-//             if j+l2_inc < list2.len() && list2[j+l2_inc] <= list1[i] {
-//                 j += l2_inc;
-//             }
-//             else{
-//                 j += 1;
-//             }
-//         }
-//     }
+    let mut blocks: Vec<HashMap<String, HashMap<u32, Vec<u32>>>> = Vec::new();
+    for i in 1..=num_blocks {
+        let data = fs::read(format!("block_{}.bin", i)).unwrap();
+        let block = bincode::deserialize(&data).unwrap();
+        blocks.push(block);
+    }
+    println!("  Blocks loaded into memory");
 
-//     intersect_list
-// }
+    let mut all_terms: HashSet<String> = HashSet::new();
+    for block in &blocks {
+        for term in block.keys() {
+            all_terms.insert(term.clone());
+        }
+    }
+    let mut sorted_terms: Vec<String> = all_terms.into_iter().collect();
+    sorted_terms.sort();
+    println!("  Unique terms to merge: {}", sorted_terms.len());
+
+    let mut postings = File::create("final_index.bin").unwrap();
+    let mut offset: u64 = 0;
+    let mut term_index: HashMap<String, (u64, u64, u32)> = HashMap::new();
+
+    for term in &sorted_terms {
+        let mut merged_postings: HashMap<u32, Vec<u32>> = HashMap::new();
+        for block in &blocks {
+            if let Some(postings) = block.get(term) {
+                for (doc_id, positions) in postings {
+                    merged_postings.insert(*doc_id, positions.clone());
+                }
+            }
+        }
+        let encoded = bincode::serialize(&merged_postings).unwrap();
+        postings.write_all(&encoded).unwrap();
+        let length = encoded.len() as u64;
+        let doc_freq = merged_postings.len() as u32;
+        term_index.insert(term.clone(), (offset, length, doc_freq));
+        offset += length;
+    }
+
+    println!("  Final index size: {} bytes", offset);
+    term_index
+}
+
+fn read_postings(term: &str, term_index: &HashMap<String, (u64, u64, u32)>) -> Option<HashMap<u32, Vec<u32>>> {
+    let meta = term_index.get(term)?;
+    let mut file = File::open("final_index.bin").unwrap();
+    file.seek(SeekFrom::Start(meta.0)).unwrap();
+    let mut buffer = vec![0u8; meta.1 as usize];
+    file.read_exact(&mut buffer).unwrap();
+    Some(bincode::deserialize(&buffer).unwrap())
+}
