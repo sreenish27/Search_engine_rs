@@ -23,7 +23,7 @@ fn main() {
     traverse(root, &mut index_map, &mut doc_id, &mut doc_map, &mut gram_index);
     //to process the remaining docs that didn't hit the 4000 block checkpoint
     if !index_map.is_empty() {
-        let encoded = bincode::serialize(&index_map).unwrap();
+        let encoded = serialize_block(&index_map);
         let block_num = (doc_id / 4000) + 1;
         let filename = format!("block_{}.bin", block_num);
         let mut file = File::create(&filename).unwrap();
@@ -65,6 +65,20 @@ fn main() {
             }
         }
     }
+    //to inform user im dropping stuff not there at all
+    let before_len = query_list.len();
+    query_list.retain(|term| {
+        if term_index.contains_key(term) {
+            true
+        } else {
+            println!("  Dropping '{}' — no match found in index", term);
+            false
+        }
+    });
+    if query_list.len() < before_len {
+        println!("  Warning: {} term(s) dropped, results may be broader than intended", before_len - query_list.len());
+    }
+
     let corrected_query: String = query_list.join(" ");
     println!("  Did you mean: \x1b[3m{}\x1b[0m?", corrected_query);
     println!("  Spell check time: {:?}", t.elapsed());
@@ -105,7 +119,7 @@ fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>,
             //block-based processing - every 4000 docs, write current index to disk in binary format and clear memory
             if *doc_id > 0 && *doc_id % 4000 == 0 {
                 println!("  Writing block {} to disk, clearing memory", *doc_id / 4000);
-                let encoded = bincode::serialize(&index_map).unwrap();
+                let encoded = serialize_block(&index_map);
                 let filename = format!("block_{}.bin", *doc_id / 4000);
                 let mut file = File::create(&filename).unwrap();
                 file.write_all(&encoded).unwrap();
@@ -166,7 +180,7 @@ fn docid_list(term_list: &Vec<String>, term_index: &HashMap<String, (u64, u64, u
         file.seek(SeekFrom::Start(*offset)).unwrap();
         let mut buffer = vec![0u8; *length as usize];
         file.read_exact(&mut buffer).unwrap();
-        let postings: HashMap<u32, Vec<u32>> = bincode::deserialize(&buffer).unwrap();
+        let postings: HashMap<u32, Vec<u32>> = deserialize_postings(&buffer);
         let mut doc_ids: Vec<u32> = postings.keys().cloned().collect();
         doc_ids.sort();
         println!("    '{}': {} docs (read {} bytes from offset {})", term, doc_ids.len(), length, offset);
@@ -299,7 +313,7 @@ fn spell_corrector(term: &str, tri_gram_index: &BTreeMap<String, Vec<String>>) -
     let mut possible_list: Vec<(String, usize)> = Vec::new();
     for (candidate, _score) in candidates.iter() {
         let e_distance: usize = edit_distance(term, candidate);
-        if e_distance < term.len() / 3 {
+        if e_distance < term.len() / 2 {
             possible_list.push((candidate.clone(), e_distance));
         }
     }
@@ -363,7 +377,7 @@ fn merge_index_map() -> HashMap<String, (u64, u64, u32)> {
     let mut blocks: Vec<HashMap<String, HashMap<u32, Vec<u32>>>> = Vec::new();
     for i in 1..=num_blocks {
         let data = fs::read(format!("block_{}.bin", i)).unwrap();
-        let block = bincode::deserialize(&data).unwrap();
+        let block = deserialize_block(&data);
         blocks.push(block);
     }
     println!("  Blocks loaded into memory");
@@ -401,7 +415,7 @@ fn merge_index_map() -> HashMap<String, (u64, u64, u32)> {
             }
         }
         //write merged postings to disk
-        let encoded = bincode::serialize(&merged_postings).unwrap();
+        let encoded = serialize_postings(&merged_postings);
         postings.write_all(&encoded).unwrap();
 
         //write index to RAM - store offset, length, and doc_freq
@@ -425,7 +439,163 @@ fn read_postings(term: &str, term_index: &HashMap<String, (u64, u64, u32)>) -> O
     file.seek(SeekFrom::Start(meta.0)).unwrap();
     let mut buffer = vec![0u8; meta.1 as usize];
     file.read_exact(&mut buffer).unwrap();
-    Some(bincode::deserialize(&buffer).unwrap())
+    Some(deserialize_postings(&buffer))
+}
+
+//a function to basically - encode my content to binary - but being clear about size using gap encoding
+fn vbyte_encode(mut n: u32, out: &mut Vec<u8>) {
+    let mut tmp = [0u8; 5];
+    let mut len = 0;
+    loop {
+        tmp[len] = (n & 0x7F) as u8;
+        n >>= 7;
+        len += 1;
+        if n == 0 { break; }
+    }
+    for i in (1..len).rev() {
+        out.push(tmp[i]);
+    }
+    out.push(tmp[0] | 0x80);
+}
+
+//to decode the encoded stuff
+fn vbyte_decode(data: &[u8]) -> (u32, usize) {
+    let mut result: u32 = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        if byte & 0x80 != 0 {
+            result = (result << 7) | (byte & 0x7F) as u32;
+            return (result, i + 1);
+        }
+        result = (result << 7) | (byte & 0x7F) as u32;
+    }
+    panic!("unterminated vbyte");
+}
+//this takes the encode and does serialize on my postings basically
+fn serialize_postings(postings: &HashMap<u32, Vec<u32>>) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // sort doc IDs so gaps are always positive
+    let mut doc_ids: Vec<u32> = postings.keys().copied().collect();
+    doc_ids.sort();
+
+    // write doc count
+    vbyte_encode(doc_ids.len() as u32, &mut out);
+
+    let mut prev_doc: u32 = 0;
+    for &doc_id in &doc_ids {
+        // write doc ID gap (first doc writes full ID since prev_doc = 0)
+        vbyte_encode(doc_id - prev_doc, &mut out); //this is the gap encoding - where gaps between doc_ids is calcualted
+        prev_doc = doc_id;
+
+        let positions = &postings[&doc_id];
+
+        // write position count
+        vbyte_encode(positions.len() as u32, &mut out);
+
+        // write position gaps
+        let mut prev_pos: u32 = 0;
+        for &pos in positions {
+            vbyte_encode(pos - prev_pos, &mut out);
+            prev_pos = pos;
+        }
+    }
+
+    out
+}
+//this decodes it
+fn deserialize_postings(data: &[u8]) -> HashMap<u32, Vec<u32>> {
+    let mut postings = HashMap::new();
+    let mut offset = 0;
+
+    // read doc count
+    let (doc_count, bytes_read) = vbyte_decode(&data[offset..]);
+    offset += bytes_read;
+
+    let mut prev_doc: u32 = 0;
+    for _ in 0..doc_count {
+        // read doc ID gap, reconstruct absolute ID
+        let (gap, bytes_read) = vbyte_decode(&data[offset..]);
+        offset += bytes_read;
+        let doc_id = prev_doc + gap;
+        prev_doc = doc_id;
+
+        // read position count
+        let (pos_count, bytes_read) = vbyte_decode(&data[offset..]);
+        offset += bytes_read;
+
+        // read position gaps, reconstruct absolute positions
+        let mut positions = Vec::with_capacity(pos_count as usize);
+        let mut prev_pos: u32 = 0;
+        for _ in 0..pos_count {
+            let (gap, bytes_read) = vbyte_decode(&data[offset..]);
+            offset += bytes_read;
+            let pos = prev_pos + gap;
+            positions.push(pos);
+            prev_pos = pos;
+        }
+
+        postings.insert(doc_id, positions);
+    }
+
+    postings
+}
+
+fn serialize_block(index_map: &HashMap<String, HashMap<u32, Vec<u32>>>) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    // sort terms alphabetically for consistent ordering and merge-friendly reads
+    let mut terms: Vec<&String> = index_map.keys().collect();
+    terms.sort();
+
+    // write term count
+    vbyte_encode(terms.len() as u32, &mut out);
+
+    for term in &terms {
+        let term_bytes = term.as_bytes();
+
+        // write term length + raw term bytes
+        vbyte_encode(term_bytes.len() as u32, &mut out);
+        out.extend_from_slice(term_bytes);
+
+        // serialize this term's postings
+        let postings_bytes = serialize_postings(&index_map[*term]);
+
+        // write postings length + postings bytes
+        vbyte_encode(postings_bytes.len() as u32, &mut out);
+        out.extend_from_slice(&postings_bytes);
+    }
+
+    out
+}
+
+fn deserialize_block(data: &[u8]) -> HashMap<String, HashMap<u32, Vec<u32>>> {
+    let mut block = HashMap::new();
+    let mut offset = 0;
+
+    // read term count
+    let (term_count, bytes_read) = vbyte_decode(&data[offset..]);
+    offset += bytes_read;
+
+    for _ in 0..term_count {
+        // read term length + raw term bytes
+        let (term_len, bytes_read) = vbyte_decode(&data[offset..]);
+        offset += bytes_read;
+
+        let term = String::from_utf8(data[offset..offset + term_len as usize].to_vec())
+            .expect("invalid utf-8 in term");
+        offset += term_len as usize;
+
+        // read postings length + postings bytes
+        let (postings_len, bytes_read) = vbyte_decode(&data[offset..]);
+        offset += bytes_read;
+
+        let postings = deserialize_postings(&data[offset..offset + postings_len as usize]);
+        offset += postings_len as usize;
+
+        block.insert(term, postings);
+    }
+
+    block
 }
 
 // //a function to just intersect 2 lists - also implement skip pointers within - to reduce no. of operations being done
