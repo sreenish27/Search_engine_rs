@@ -1,6 +1,48 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
 
 //a class of functions which takes data and serializes into contiguous bytes and de-serializes back into data more effectively than rust library
+
+//a class for blockreader
+pub struct BlockReader {
+    data: Vec<u8>,
+    offset:usize,
+    remaining:u32,
+}
+
+impl BlockReader {
+    pub fn new(filename: &str) -> Self {
+        let data = fs::read(filename).unwrap();
+        let (term_count, bytes_read) = vbyte_decode(&data);
+        BlockReader {
+            data,
+            offset: bytes_read,
+            remaining: term_count,
+        }
+    }
+
+    pub fn next_entry(&mut self) -> Option<(String, HashMap<u32, Vec<u32>>)> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+    
+        // everything below is copied from your deserialize_block loop
+        let (term_len, bytes_read) = vbyte_decode(&self.data[self.offset..]);
+        self.offset += bytes_read;
+    
+        let term = String::from_utf8(self.data[self.offset..self.offset + term_len as usize].to_vec())
+            .expect("invalid utf-8");
+        self.offset += term_len as usize;
+    
+        let (postings_len, bytes_read) = vbyte_decode(&self.data[self.offset..]);
+        self.offset += bytes_read;
+    
+        let postings = deserialize_postings(&self.data[self.offset..self.offset + postings_len as usize]);
+        self.offset += postings_len as usize;
+    
+        Some((term, postings))
+    }
+}
 
 //a function to basically - encode my content to binary - but being clear about size using gap encoding
 pub fn vbyte_encode(mut n: u32, out: &mut Vec<u8>) {
