@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::get_posting::read_postings;
+use crate::{block_merge::TermEntry, get_posting::read_postings};
 
 //a couple of functions which captures checking if a sequence of words occur in order across documents
 //checks if a phrase exists in a document by verifying consecutive positions
@@ -27,11 +27,11 @@ pub fn has_phrase(doc_id: u32, query_terms: &Vec<String>, all_postings: &Vec<Has
 
 //filters the doc list to only docs containing the exact phrase
 //reads postings from disk once for all terms, then checks positional adjacency
-pub fn phrase_filter(final_list: Vec<u32>, query_terms: &Vec<String>, term_index: &HashMap<String, (u64, u64, u32)>) -> Vec<u32> {
+pub fn phrase_filter(final_list: Vec<u32>, query_terms: &Vec<String>, term_index: &HashMap<String, TermEntry>, tier_idx: usize) -> Vec<u32> {
     //read all postings once from disk - don't read per document
     let mut all_postings: Vec<HashMap<u32, Vec<u32>>> = Vec::new();
     for term in query_terms {
-        all_postings.push(read_postings(term, term_index).unwrap());
+        all_postings.push(read_postings(term, term_index, tier_idx).unwrap());
     }
     println!("  Phrase filtering {} candidates", final_list.len());
     let mut phrase_results: Vec<u32> = Vec::new();

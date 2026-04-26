@@ -3,6 +3,7 @@ use std::{collections::HashMap, fs};
 //a class of functions which takes data and serializes into contiguous bytes and de-serializes back into data more effectively than rust library
 
 //a class for blockreader
+#[derive(Debug, Clone)]
 pub struct BlockReader {
     data: Vec<u8>,
     offset:usize,

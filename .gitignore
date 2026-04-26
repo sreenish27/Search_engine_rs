@@ -4,3 +4,5 @@ target/
 .DS_Store
 docmap.json
 *.bin
+tf_dump.csv
+histogram.py

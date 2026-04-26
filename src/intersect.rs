@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Read};
+use crate::block_merge::TermEntry;
 use crate::encode_decode::deserialize_postings;
 
 //a class of functions which - intersects between 2 lists of doc_ids from different terms in the fastest way for minimal time and memory complexity
@@ -42,27 +43,33 @@ pub fn intersect_two(list1: &Vec<u32>, list2: &Vec<u32>) -> Vec<u32> {
 //a function which gets the list of docIDs to intersect
 //uses term_index (RAM dictionary) to get offsets, reads postings from disk
 //sorts by doc_freq (smallest first) for optimal intersection order
-pub fn docid_list(term_list: &Vec<String>, term_index: &HashMap<String, (u64, u64, u32)>) -> Vec<Vec<u32>> {
-    let mut term_meta: Vec<(&String, u64, u64, u32)> = Vec::new();
+pub fn docid_list(term_list: &Vec<String>, term_index: &HashMap<String, TermEntry>, tier_idx: usize) -> Vec<Vec<u32>> {
+    let mut term_meta: Vec<(&String, &TermEntry)> = Vec::new();
     //get the metadata for each query term from RAM dictionary
     for term in term_list {
         if let Some(meta_data) = term_index.get(term) {
-            term_meta.push((term, meta_data.0, meta_data.1, meta_data.2));
+            term_meta.push((term, meta_data));
         }
     }
     //sort by doc_freq, smallest first - to minimize intermediate results during intersection
-    term_meta.sort_by_key(|t| t.3);
+    term_meta.sort_by_key(|t| t.1.doc_freq);
 
     //now use offset and length to read posting lists from disk
-    println!("  Reading {} posting lists from disk", term_meta.len());
+    println!("  Reading {} posting lists from disk (tier {})", term_meta.len(), tier_idx);
     let mut file = File::open("final_index.bin").unwrap();
     let mut posting_lists: Vec<Vec<u32>> = Vec::new();
 
     //this uses the offset in term_meta to seek into the disk file, reads the postings and deserializes
     //we are getting only doc_ids here (keys) - not positional index, that comes during phrase filtering
-    for (term, offset, length, doc_freq) in &term_meta {
-        file.seek(SeekFrom::Start(*offset)).unwrap();
-        let mut buffer = vec![0u8; *length as usize];
+    for (term, entry) in &term_meta {
+        let (offset, length) = entry.tiers[tier_idx];
+        //if nothing exist in a tier do not want it to panic - instead return an empty list
+        if length == 0 {
+            posting_lists.push(Vec::new());
+            continue
+        }
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut buffer = vec![0u8; length as usize];
         file.read_exact(&mut buffer).unwrap();
         let postings: HashMap<u32, Vec<u32>> = deserialize_postings(&buffer);
         let mut doc_ids: Vec<u32> = postings.keys().cloned().collect();

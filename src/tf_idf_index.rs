@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::get_posting::read_postings;
+use crate::{block_merge::TermEntry, get_posting::read_postings};
 
 //a class of functions to calculate the tf_idf scores and rank the search results using it
 
@@ -16,11 +16,11 @@ pub fn tf_idf(t_f: f32, n: f32, df: f32) -> f32 {
 }
 
 //a ranking function which uses tf - idf 
-pub fn rank_results(results: Vec<u32>, term_index: &HashMap<String, (u64, u64, u32)>, terms: &Vec<String>, total_docs:f32, doc_vec_len: &HashMap<u32, f32>) -> Vec<(u32, f32)> {
+pub fn rank_results(results: Vec<u32>, term_index: &HashMap<String, TermEntry>, terms: &Vec<String>, total_docs:f32, doc_vec_len: &HashMap<u32, f32>, tier_idx: usize) -> Vec<(u32, f32)> {
     let mut all_postings: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
     //get all required postings for each term and store - only once we retrieve and deserialize
     for term in terms {
-        let posting = read_postings(&term, term_index).unwrap();
+        let posting = read_postings(&term, term_index, tier_idx).unwrap();
         all_postings.insert(term.clone(), posting);
     }
 

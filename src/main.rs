@@ -1,4 +1,4 @@
-use std::hash::Hash;
+// use std::hash::Hash;
 use std::{collections::HashMap, fs};
 use std::fs::File;
 use std::io::Write;
@@ -42,6 +42,8 @@ fn main() {
     let mut doc_map: HashMap<u32, String> = HashMap::new();
     //3-gram index to take care of wildcard queries and spell correction
     let mut gram_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    //a variable to hold the tier we are currently selecting (withi a term - doc_ids are segregrated into tiers based on - term frequency - to implement tiered_index - reducing no of tf_idf operations we do)
+    let mut tier_idx:usize = 0;
 
     println!("--- INDEX CONSTRUCTION ---");
     let t = Instant::now();
@@ -71,13 +73,16 @@ fn main() {
     println!("--- READY FOR QUERIES ---");
     println!("  Total setup time: {:?}", total_start.elapsed());
 
-    //make user give a search query and give docIDs which match
-    //accept user query
-    let mut query: String = String::new();
-    println!("\nEnter your search query:");
-    io::stdin().read_line(&mut query).unwrap();
-    let start = Instant::now();
-    let query = query.trim().to_lowercase().to_string();
+    //query loop - keep accepting queries till user types "quit"
+    loop {
+        let mut query: String = String::new();
+        println!("\nEnter your search query (or 'quit' to exit):");
+        io::stdin().read_line(&mut query).unwrap();
+        let query = query.trim().to_lowercase().to_string();
+        if query == "quit" || query == "exit" || query.is_empty() {
+            println!("Goodbye.");
+            break;
+        }
 
     let mut query_list: Vec<String> = query.split_whitespace().map(|w| w.to_string()).collect();
 
@@ -110,41 +115,83 @@ fn main() {
     println!("  Did you mean: \x1b[3m{}\x1b[0m?", corrected_query);
     println!("  Spell check time: {:?}", t.elapsed());
 
-    println!("--- RETRIEVING POSTINGS ---");
-    let t = Instant::now();
-    let term_list = docid_list(&query_list, &term_index);
-    println!("  Postings retrieval time: {:?}", t.elapsed());
+    let total_t = Instant::now();
 
-    println!("--- INTERSECTING ---");
-    let t = Instant::now();
-    let results = intersect_all(term_list);
-    println!("  Documents after intersection: {}", results.len());
-    println!("  Intersection time: {:?}", t.elapsed());
+    let k: usize = 10;
+    let mut all_ranked: Vec<(u32, f32)> = Vec::new();
+    let mut seen: HashSet<u32> = HashSet::new();
 
-    //phrase filter - checks positional adjacency for exact phrase matches
-    println!("--- PHRASE FILTERING ---");
-    let t = Instant::now();
-    let results = phrase_filter(results, &query_list, &term_index);
-    println!("  Documents after phrase filter: {}", results.len());
-    println!("  Phrase filter time: {:?}", t.elapsed());
+    println!("\n========================================");
+    println!("  TIERED RETRIEVAL — target K = {}", k);
+    println!("========================================");
 
-    println!("--- RESULTS ---");
-    println!("{:?}", results);
+    for tier_idx in 0..3 {
+        println!("\n>>> TIER {} <<<", tier_idx);
 
-    //rank the results
-    let ranked_results = rank_results(results, &term_index, &query_list, tot_docs, &doc_vec_len);
-    println!("--- RANKED RESULTS ---");
-    println!("{:?}", ranked_results);
+        println!("--- RETRIEVING POSTINGS (tier {}) ---", tier_idx);
+        let t = Instant::now();
+        let term_list = docid_list(&query_list, &term_index, tier_idx);
+        println!("  Postings retrieval time: {:?}", t.elapsed());
 
-    
+        println!("--- INTERSECTING (tier {}) ---", tier_idx);
+        let t = Instant::now();
+        let results = intersect_all(term_list);
+        println!("  Documents after intersection: {}", results.len());
+        println!("  Intersection time: {:?}", t.elapsed());
 
-    let duration = start.elapsed();
-    println!("Total search time: {:?}", duration);
+        //phrase filter - checks positional adjacency for exact phrase matches
+        println!("--- PHRASE FILTERING (tier {}) ---", tier_idx);
+        let t = Instant::now();
+        let results = phrase_filter(results, &query_list, &term_index, tier_idx);
+        println!("  Documents after phrase filter: {}", results.len());
+        println!("  Phrase filter time: {:?}", t.elapsed());
 
-    //get the location of all of them
-    for (doc_id, score) in &ranked_results {
-        let path = &doc_map[doc_id];
-        println!("  Doc {}: {:.4} → {}", doc_id, score, path);
+        //dedup - skip docs already scored in a higher tier
+        let before_dedup = results.len();
+        let new_results: Vec<u32> = results.into_iter()
+            .filter(|d| seen.insert(*d))
+            .collect();
+        let deduped = before_dedup - new_results.len();
+        if deduped > 0 {
+            println!("  Deduped {} doc(s) already seen in higher tiers", deduped);
+        }
+
+        if new_results.is_empty() {
+            println!("  No new docs in tier {}, moving on", tier_idx);
+            continue;
+        }
+
+        //rank the new results from this tier
+        println!("--- RANKING (tier {}) ---", tier_idx);
+        let t = Instant::now();
+        let ranked = rank_results(new_results, &term_index, &query_list, tot_docs, &doc_vec_len, tier_idx);
+        println!("  Ranked {} new docs from tier {}", ranked.len(), tier_idx);
+        println!("  Ranking time: {:?}", t.elapsed());
+
+        all_ranked.extend(ranked);
+        println!("  Cumulative results so far: {} / target {}", all_ranked.len(), k);
+
+        if all_ranked.len() >= k {
+            println!("  >>> Reached K, stopping fallback at tier {} <<<", tier_idx);
+            break;
+        }
     }
+
+    //final sort across all tiers' results - high tier docs naturally outrank low tier
+    //because their tf is higher, but we sort defensively so ranking is stable.
+    all_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    all_ranked.truncate(k);
+
+    println!("\n========================================");
+    println!("  FINAL RANKED RESULTS (top {})", all_ranked.len());
+    println!("========================================");
+    for (rank, (doc_id, score)) in all_ranked.iter().enumerate() {
+        let path = &doc_map[doc_id];
+        println!("  #{:>2}  doc {:>5}  score={:.4}  →  {}", rank + 1, doc_id, score, path);
+    }
+
+    println!("\n  Total tiered search time: {:?}", total_t.elapsed());
+
+}
 
 }
