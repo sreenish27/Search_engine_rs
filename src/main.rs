@@ -139,12 +139,14 @@ fn main() {
         println!("  Documents after intersection: {}", results.len());
         println!("  Intersection time: {:?}", t.elapsed());
 
-        //phrase filter - checks positional adjacency for exact phrase matches
-        println!("--- PHRASE FILTERING (tier {}) ---", tier_idx);
-        let t = Instant::now();
-        let results = phrase_filter(results, &query_list, &term_index, tier_idx);
-        println!("  Documents after phrase filter: {}", results.len());
-        println!("  Phrase filter time: {:?}", t.elapsed());
+        // //phrase filter - checks positional adjacency for exact phrase matches
+        // // RETIRED May 1 — replaced by proximity scoring (omega_calc + boost_calc) in tf_idf_index.rs
+        // // phrase_check.rs kept on disk for reference; mod declaration removed below
+        // println!("--- PHRASE FILTERING (tier {}) ---", tier_idx);
+        // let t = Instant::now();
+        // let results = phrase_filter(results, &query_list, &term_index, tier_idx);
+        // println!("  Documents after phrase filter: {}", results.len());
+        // println!("  Phrase filter time: {:?}", t.elapsed());
 
         //dedup - skip docs already scored in a higher tier
         let before_dedup = results.len();
@@ -177,8 +179,11 @@ fn main() {
         }
     }
 
-    //final sort across all tiers' results - high tier docs naturally outrank low tier
-    //because their tf is higher, but we sort defensively so ranking is stable.
+    //final sort across all tiers' results.
+    //IMPORTANT: not optional. Cosine norm divides by doc length, so a tier-2
+    //short doc can outscore a tier-0 long doc (e.g. doc 8802 vs doc 9059 on
+    //"united states of america"). Without this sort, lower-tier wins are
+    //ranked behind higher-tier losses.
     all_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     all_ranked.truncate(k);
 

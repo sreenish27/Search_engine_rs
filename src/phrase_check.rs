@@ -1,3 +1,4 @@
+//retiring this for now - as we are using - proximity based omega and boost functions within tf_idf index file
 use std::collections::HashMap;
 use crate::{block_merge::TermEntry, get_posting::read_postings};
 
