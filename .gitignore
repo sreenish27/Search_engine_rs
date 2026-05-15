@@ -8,3 +8,5 @@ tf_dump.csv
 histogram.py
 .DS_Store
 *.pyc
+failures.jsonl
+corpus/

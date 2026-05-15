@@ -9,6 +9,7 @@ const VERBOSE: bool = true;
 
 //term frequency - function
 pub fn tf_idf(t_f: f32, n: f32, df: f32) -> f32 {
+    //declare constants within for modularity and changing it later
     if t_f == 0.0 {
         return 0.0;
     }
@@ -17,6 +18,24 @@ pub fn tf_idf(t_f: f32, n: f32, df: f32) -> f32 {
     let idf = (n/df).log10();
 
     tf*idf
+}
+
+//bm25 complete function
+pub fn bm25(t_f: f32, n: f32, d_f: f32, dl: f32, avgdl: f32) -> f32 {
+    if t_f == 0.0 {
+        return 0.0;
+    }
+
+    //hyperparameters
+    let k1: f32 = 1.2;
+    let b: f32 = 0.75;
+
+    let idf = (n / d_f).log10();
+    let length_factor = (1.0 - b) + b * (dl / avgdl);
+    let numerator = (k1 + 1.0) * t_f;
+    let denominator = t_f + k1 * length_factor;
+
+    idf * (numerator / denominator)
 }
 
 //a function to assist omega function - ingests a list of lists (list of positional index for a particular doc_id across terms)

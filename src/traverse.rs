@@ -9,6 +9,7 @@ use crate::cleanup::{read_contents, split_string};
 
 //recursively traverses through a folder to get to all the files
 //gets each file's path and processes the file contents into the inverted index
+//added two vairables to capture document length and - average document length (to help with BM25 calculations)
 pub fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>, doc_id: &mut u32, doc_map: &mut HashMap<u32, String>, gram_index: &mut BTreeMap<String, Vec<String>>) {
     let entries = fs::read_dir(path).unwrap();
     for entry in entries {
@@ -31,6 +32,8 @@ pub fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32
             doc_map.insert(*doc_id, entry.path().to_str().unwrap().to_string());
             let file_content = read_contents(entry.path().to_str().unwrap());
             let terms: Vec<String> = split_string(file_content);
+            // //code to insert doc length to the hashmap
+            // doc_lengths.insert(*doc_id, terms.len() as u32);
             //code block to create the inverted index and also positional index
             //also builds trigram index for new terms (for spell correction)
             for (pos, term) in terms.iter().enumerate() {

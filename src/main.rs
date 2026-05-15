@@ -1,12 +1,11 @@
 // use std::hash::Hash;
-use std::{collections::HashMap, fs};
+use std::{collections::HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::io;
 use std::time::Instant;
 use std::collections::{BTreeMap, HashSet};
 
-use std::io::{Seek, SeekFrom, Read};
 
 //import all written libraries
 mod traverse;
@@ -22,19 +21,15 @@ mod tf_idf_index;
 
 //specify the functions being used
 use traverse::traverse;
-use cleanup::{read_contents, split_string};
-use encode_decode::{serialize_block, deserialize_block, serialize_postings, deserialize_postings, vbyte_encode, vbyte_decode};
+use encode_decode::{serialize_block};
 use block_merge::merge_index_map;
-use get_posting::read_postings;
 use intersect::{intersect_all, docid_list};
-use phrase_check::{phrase_filter, has_phrase};
-use spell_check::{spell_corrector, jaccard_distance, three_gram_set, edit_distance};
-use three_gram_index::three_gram_index;
-use tf_idf_index::{tf_idf, rank_results};
+use spell_check::{spell_corrector};
+use tf_idf_index::{rank_results};
 
 fn main() {
     let total_start = Instant::now();
-    let root = "/Users/krithik-qfit/Desktop/Search_engine/hello_cargo/20news-bydate/20news-bydate-train";
+    let root = "/Users/krithik-qfit/Desktop/Search_engine/hello_cargo/corpus";
     //the inverted positional index hashmap - term -> {doc_id -> [positions]}
     let mut index_map: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
     let mut doc_id: u32 = 0;
@@ -42,8 +37,6 @@ fn main() {
     let mut doc_map: HashMap<u32, String> = HashMap::new();
     //3-gram index to take care of wildcard queries and spell correction
     let mut gram_index: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    //a variable to hold the tier we are currently selecting (withi a term - doc_ids are segregrated into tiers based on - term frequency - to implement tiered_index - reducing no of tf_idf operations we do)
-    let mut tier_idx:usize = 0;
 
     println!("--- INDEX CONSTRUCTION ---");
     let t = Instant::now();
@@ -91,7 +84,7 @@ fn main() {
     let t = Instant::now();
     for i in 0..query_list.len() {
         if !term_index.contains_key(&query_list[i]) {
-            let suggestions = spell_corrector(&query_list[i], &gram_index);
+            let suggestions = spell_corrector(&query_list[i], &gram_index, &term_index);
             if !suggestions.is_empty() {
                 query_list[i] = suggestions[0].clone();
             }
