@@ -10,3 +10,4 @@ histogram.py
 *.pyc
 failures.jsonl
 corpus/
+output/
