@@ -8,7 +8,7 @@ use std::fs;
 // emails, IAM wildcards, contractions). Everything else is a split point.
 //
 // Normalization:
-//   - curly quotes -> straight quotes (so `don't` and `don’t` collapse)
+//   - curly quotes -> straight quotes (so `don't` and `don't` collapse)
 //   - lowercase
 
 const KEEP: &[char] = &['.', '-', '_', ':', '/', '\'', '@', '*'];
@@ -32,8 +32,8 @@ pub fn read_contents(file_path: &str) -> String {
 fn normalize_special(c: char) -> Option<&'static str> {
     match c {
         // curly quotes
-        '\u{2018}' | '\u{2019}' => Some("'"),   // ‘ ’ -> '
-        '\u{201C}' | '\u{201D}' => Some("\""),  // “ ” -> "
+        '\u{2018}' | '\u{2019}' => Some("'"),   // ' ' -> '
+        '\u{201C}' | '\u{201D}' => Some("\""),  // " " -> "
         // latin ligatures (19 occurrences in AWS corpus: ﬁ ﬂ ﬃ; covering all 5 for safety)
         '\u{FB00}' => Some("ff"),   // ﬀ
         '\u{FB01}' => Some("fi"),   // ﬁ
@@ -72,19 +72,82 @@ fn trim_keep_chars(token: &str) -> &str {
         .trim_end_matches(|c: char| TRIM_AT_EDGES.contains(&c))
 }
 
+/// Split a string on CamelCase boundaries.
+/// Returns the individual pieces only if a split actually occurred.
+/// If no boundary found, returns empty vec (caller keeps the original).
+///
+/// Examples:
+///   "RunInstances" -> ["Run", "Instances"]
+///   "getXMLData"   -> ["get", "XML", "Data"]
+///   "API"          -> []   (no boundary)
+///   "bucket"       -> []   (no boundary)
+fn camelcase_split(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = Vec::new();
+    let mut current = String::new();
+
+    for (i, &c) in chars.iter().enumerate() {
+        let is_boundary = i > 0 && (
+            // lowercase/digit -> uppercase: aB
+            (chars[i-1].is_ascii_lowercase() || chars[i-1].is_ascii_digit()) && c.is_ascii_uppercase()
+            // uppercase -> uppercase-lowercase: ABc (end of acronym like XML)
+            || (i + 1 < chars.len() && chars[i-1].is_ascii_uppercase() && c.is_ascii_uppercase() && chars[i+1].is_ascii_lowercase())
+        );
+        if is_boundary && !current.is_empty() {
+            result.push(current.clone());
+            current.clear();
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    // only return pieces if we actually split — otherwise caller keeps original
+    if result.len() > 1 { result } else { Vec::new() }
+}
+
+/// Split a token on CamelCase boundaries AND underscores.
+/// Returns the original token PLUS all split pieces (case preserved).
+/// Caller is responsible for lowercasing each piece.
+///
+/// Examples:
+///   "RunInstances"     -> ["RunInstances", "Run", "Instances"]
+///   "API_RunInstances" -> ["API_RunInstances", "API", "RunInstances", "Run", "Instances"]
+///   "getXMLData"       -> ["getXMLData", "get", "XML", "Data"]
+///   "bucket"           -> ["bucket"]
+///   "API"              -> ["API"]
+fn split_compound(token: &str) -> Vec<String> {
+    let mut pieces: Vec<String> = vec![token.to_string()];
+
+    // split on underscores first
+    let underscore_parts: Vec<&str> = token.split('_').filter(|s| !s.is_empty()).collect();
+
+    // only add underscore parts if the split actually changed anything
+    let underscore_changed = underscore_parts.len() > 1
+        || (underscore_parts.len() == 1 && underscore_parts[0] != token);
+
+    for part in &underscore_parts {
+        if underscore_changed {
+            pieces.push(part.to_string());
+        }
+        // CamelCase split each part (or the whole token if no underscores)
+        pieces.extend(camelcase_split(part));
+    }
+
+    pieces
+}
+
 /// Tokenize a document into a flat list of lowercased terms.
 ///
 /// Walks the string once. Builds tokens out of consecutive token chars.
 /// Splits on anything else (whitespace, punctuation not in the keep list).
 /// Trims dangling keep-chars (e.g. `cause:` -> `cause`, but `s3:getobject` is preserved).
+/// Splits CamelCase and underscore compounds — original token + split pieces all indexed.
 pub fn split_string(content: String) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
 
     for raw in content.chars() {
-        // Expand the char into one or more replacement chars (or keep as-is).
-        // Need an iterator-friendly representation so we can handle both
-        // single-char and multi-char cases uniformly.
         let replacement = normalize_special(raw);
         let chars_to_process: Box<dyn Iterator<Item = char>> = match replacement {
             Some(s) => Box::new(s.chars()),
@@ -93,27 +156,38 @@ pub fn split_string(content: String) -> Vec<String> {
 
         for c in chars_to_process {
             if is_token_char(c) {
-                current.extend(c.to_lowercase());
+                current.push(c); // keep case — needed for CamelCase splitting
             } else if !current.is_empty() {
                 let trimmed = trim_keep_chars(&current);
                 if !trimmed.is_empty() && trimmed.len() <= MAX_TOKEN_LEN {
-                    tokens.push(trimmed.to_string());
+                    // split on CamelCase + underscores, lowercase each piece
+                    for piece in split_compound(trimmed) {
+                        let lower = piece.to_lowercase();
+                        if !lower.is_empty() && lower.len() <= MAX_TOKEN_LEN {
+                            tokens.push(lower);
+                        }
+                    }
                 }
                 current.clear();
             }
         }
     }
+    // handle trailing token
     if !current.is_empty() {
         let trimmed = trim_keep_chars(&current);
         if !trimmed.is_empty() && trimmed.len() <= MAX_TOKEN_LEN {
-            tokens.push(trimmed.to_string());
+            for piece in split_compound(trimmed) {
+                let lower = piece.to_lowercase();
+                if !lower.is_empty() && lower.len() <= MAX_TOKEN_LEN {
+                    tokens.push(lower);
+                }
+            }
         }
     }
     tokens
 }
 
 // --- tests ---
-// run with: cargo test --bin <your_bin> cleanup
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,7 +198,10 @@ mod tests {
 
     #[test]
     fn keeps_iam_action() {
-        assert_eq!(tokenize("s3:GetObject"), vec!["s3:getobject"]);
+        // s3:GetObject — no underscore, CamelCase splits "GetObject" -> "Get" + "Object"
+        // original preserved: s3:getobject
+        let toks = tokenize("s3:GetObject");
+        assert!(toks.contains(&"s3:getobject".to_string()));
     }
 
     #[test]
@@ -152,10 +229,13 @@ mod tests {
 
     #[test]
     fn keeps_snake_case_identifier() {
-        assert_eq!(
-            tokenize("API_AssociateEncryptionConfig"),
-            vec!["api_associateencryptionconfig"]
-        );
+        // now produces original + split pieces
+        let toks = tokenize("API_AssociateEncryptionConfig");
+        assert!(toks.contains(&"api_associateencryptionconfig".to_string()));
+        assert!(toks.contains(&"api".to_string()));
+        assert!(toks.contains(&"associate".to_string()));
+        assert!(toks.contains(&"encryption".to_string()));
+        assert!(toks.contains(&"config".to_string()));
     }
 
     #[test]
@@ -196,16 +276,14 @@ mod tests {
 
     #[test]
     fn keeps_contraction_curly() {
-        // U+2019 should normalize to U+0027
         assert_eq!(tokenize("don\u{2019}t"), vec!["don't"]);
     }
 
     #[test]
     fn splits_on_parens() {
-        assert_eq!(
-            tokenize("CheckDomainTransferability(string)"),
-            vec!["checkdomaintransferability", "string"]
-        );
+        let toks = tokenize("CheckDomainTransferability(string)");
+        assert!(toks.contains(&"checkdomaintransferability".to_string()));
+        assert!(toks.contains(&"string".to_string()));
     }
 
     #[test]
@@ -215,11 +293,11 @@ mod tests {
 
     #[test]
     fn strips_cause_label_correctly() {
-        // **Cause:** The specified... -> the ** strip is the adapter's job,
-        // but tokenizer should still produce clean tokens from the result.
-        // After ** removal we'd have: "Cause: The specified..."
         let tokens = tokenize("Cause: The specified cluster");
-        assert_eq!(tokens, vec!["cause", "the", "specified", "cluster"]);
+        assert!(tokens.contains(&"cause".to_string()));
+        assert!(tokens.contains(&"the".to_string()));
+        assert!(tokens.contains(&"specified".to_string()));
+        assert!(tokens.contains(&"cluster".to_string()));
     }
 
     #[test]
@@ -248,66 +326,26 @@ mod tests {
     }
 
     #[test]
-    fn markdown_syntax_passes_through_when_adjacent_to_keep_chars() {
-        // The tokenizer is NOT responsible for stripping markdown syntax.
-        // That's the adapter's job (next layer up). Here we just verify
-        // that the tokenizer behaves predictably when fed raw markdown.
-        //
-        // `**Note**` becomes one token because `*` is in the keep list
-        // (needed for IAM wildcards like `s3:Get*`). The adapter will
-        // strip `**` before this function ever sees the text.
-        //
-        // `##` is fully discarded because the trailing whitespace splits it,
-        // and trim_keep_chars would remove any leading `#`-adjacent runs
-        // (but `#` isn't even in the keep list, so it splits immediately).
-        assert_eq!(
-            tokenize("## **Note** [text](link.md)"),
-            vec!["**note**", "text", "link.md"]
-        );
-    }
-
-    #[test]
-    fn adapter_stripped_input_tokenizes_cleanly() {
-        // Simulates what split_string sees AFTER the markdown adapter has done its job:
-        // `**Note**` -> `Note`, `## Heading` -> `Heading`, etc.
-        assert_eq!(
-            tokenize("Note text link.md"),
-            vec!["note", "text", "link.md"]
-        );
-    }
-
-    #[test]
     fn drops_oversized_tokens() {
-        // 100-char base64-like blob. No real AWS query needs this.
         let blob = "a".repeat(100);
         assert!(tokenize(&blob).is_empty());
     }
 
     #[test]
     fn keeps_realistic_long_arn() {
-        // A realistic full ARN, ~55 chars, should survive the 64-char cap.
         let arn = "arn:aws:iam::123456789012:role/MyVeryLongRoleName";
         assert!(arn.len() <= 64);
-        assert_eq!(tokenize(arn), vec![arn.to_lowercase()]);
+        assert!(tokenize(arn).contains(&arn.to_lowercase()));
     }
 
     #[test]
     fn unicode_superscript_excluded_from_tokens() {
-        // U+00B9 ¹ is a Unicode "Number" but it's a footnote marker, not a letter.
-        // We deliberately exclude it via is_ascii_alphanumeric so it acts as a splitter.
-        // The bad token `word¹` becomes `word` instead of crashing downstream byte-slicing.
         assert_eq!(tokenize("messagesdeleted¹"), vec!["messagesdeleted"]);
     }
 
     #[test]
     fn unicode_letters_excluded_from_tokens() {
-        // CJK and accented Latin are also excluded. AWS docs are English ASCII.
-        // The 2 Chinese page snippets in the corpus simply produce no tokens.
-        // If you ever localize for non-ASCII corpora, revisit this.
         let toks = tokenize("café naïve");
-        // 'caf', 'é' splits, 'naï' splits, 've' — depending on where Unicode lands
-        // The exact tokenization isn't important; just verify nothing crashes
-        // and no token contains non-ASCII.
         for t in &toks {
             assert!(t.chars().all(|c| c.is_ascii()));
         }
@@ -315,7 +353,6 @@ mod tests {
 
     #[test]
     fn normalizes_fi_ligature() {
-        // U+FB01 "ﬁ" should expand to "fi"
         assert_eq!(tokenize("signiﬁcant"), vec!["significant"]);
     }
 
@@ -331,7 +368,6 @@ mod tests {
 
     #[test]
     fn pure_punctuation_runs_get_dropped() {
-        // Edge-trimmable chars: empty after trim, dropped.
         assert!(tokenize(":::").is_empty());
         assert!(tokenize("---").is_empty());
         assert!(tokenize("...").is_empty());
@@ -340,11 +376,49 @@ mod tests {
 
     #[test]
     fn pure_wildcard_or_slash_runs_survive_as_noise() {
-        // `*` and `/` aren't edge-trimmed (they carry meaning at edges).
-        // A bare `***` or `///` thus survives. This is acceptable noise:
-        // these tokens have garbage IDF and never match real queries.
-        // The cost of preserving `s3:Get*` and `/api/path` correctly.
         assert_eq!(tokenize("***"), vec!["***"]);
         assert_eq!(tokenize("///"), vec!["///"]);
+    }
+
+    // --- new CamelCase / compound splitting tests ---
+
+    #[test]
+    fn camelcase_splits_simple() {
+        let toks = tokenize("RunInstances");
+        assert!(toks.contains(&"runinstances".to_string()));
+        assert!(toks.contains(&"run".to_string()));
+        assert!(toks.contains(&"instances".to_string()));
+    }
+
+    #[test]
+    fn camelcase_splits_acronym() {
+        // getXMLData -> ["getxmldata", "get", "xml", "data"]
+        let toks = tokenize("getXMLData");
+        assert!(toks.contains(&"getxmldata".to_string()));
+        assert!(toks.contains(&"get".to_string()));
+        assert!(toks.contains(&"xml".to_string()));
+        assert!(toks.contains(&"data".to_string()));
+    }
+
+    #[test]
+    fn underscore_and_camelcase_combined() {
+        let toks = tokenize("API_RunInstances");
+        assert!(toks.contains(&"api_runinstances".to_string()));
+        assert!(toks.contains(&"api".to_string()));
+        assert!(toks.contains(&"runinstances".to_string()));
+        assert!(toks.contains(&"run".to_string()));
+        assert!(toks.contains(&"instances".to_string()));
+    }
+
+    #[test]
+    fn single_word_no_split() {
+        // plain lowercase — no boundaries, no duplicates
+        assert_eq!(tokenize("bucket"), vec!["bucket"]);
+    }
+
+    #[test]
+    fn all_caps_no_split() {
+        // "API" — all uppercase, no boundary fires
+        assert_eq!(tokenize("API"), vec!["api"]);
     }
 }

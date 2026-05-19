@@ -1,191 +1,194 @@
-use std::{char::MAX, cmp::Reverse, collections::{BinaryHeap, HashMap}, f32::MIN};
+use std::collections::HashMap;
 use std::time::Instant;
-use crate::{block_merge::TermEntry, get_posting::read_postings};
+use crate::block_merge::TermEntry;
+use crate::get_posting::read_postings;
+use crate::encode_decode::Field;
+use crate::traverse::DocStats;
 
 // Toggle diagnostic prints on/off. Set to false to measure pure scoring time.
 const VERBOSE: bool = true;
 
-//a class of functions to calculate the tf_idf scores and rank the search results using it
+//a class of functions to calculate BM25F scores and rank the search results using it
 
-//term frequency - function
-pub fn tf_idf(t_f: f32, n: f32, df: f32) -> f32 {
-    //declare constants within for modularity and changing it later
-    if t_f == 0.0 {
-        return 0.0;
-    }
-    //apply tf_idf formula
-    let tf = 1.0 + t_f.log10();
-    let idf = (n/df).log10();
-
-    tf*idf
+pub struct AvgLengths {
+    pub title:   f32,
+    pub headers: f32,
+    pub code:    f32,
+    pub body:    f32,
 }
 
-//bm25 complete function
-pub fn bm25(t_f: f32, n: f32, d_f: f32, dl: f32, avgdl: f32) -> f32 {
-    if t_f == 0.0 {
-        return 0.0;
+pub fn compute_avg_lengths(doc_stats: &HashMap<u32, DocStats>) -> AvgLengths {
+    debug_assert!(!doc_stats.is_empty(), "compute_avg_lengths called with empty doc_stats");
+
+    let n = doc_stats.len() as f64;
+
+    let mut sum_title:   f64 = 0.0;
+    let mut sum_headers: f64 = 0.0;
+    let mut sum_code:    f64 = 0.0;
+    let mut sum_body:    f64 = 0.0;
+
+    for stats in doc_stats.values() {
+        sum_title   += stats.len_title   as f64;
+        sum_headers += stats.len_headers as f64;
+        sum_code    += stats.len_code    as f64;
+        sum_body    += stats.len_body    as f64;
     }
 
-    //hyperparameters
-    let k1: f32 = 1.2;
-    let b: f32 = 0.75;
-
-    let idf = (n / d_f).log10();
-    let length_factor = (1.0 - b) + b * (dl / avgdl);
-    let numerator = (k1 + 1.0) * t_f;
-    let denominator = t_f + k1 * length_factor;
-
-    idf * (numerator / denominator)
+    AvgLengths {
+        title:   (sum_title   / n) as f32,
+        headers: (sum_headers / n) as f32,
+        code:    (sum_code    / n) as f32,
+        body:    (sum_body    / n) as f32,
+    }
 }
 
-//a function to assist omega function - ingests a list of lists (list of positional index for a particular doc_id across terms)
-//initialize pointer - and find omega basically - but want to keep it clean and seperate
-/// Compute the smallest window that contains at least one position from each term.
-/// Caller must guarantee:
-///   - k >= 2 (multi-term query only; no window boost for single-term queries).
-///   - every position list is non-empty (doc has at least one occurrence per term).
-pub fn window_calc(position_lists: &[&[u32]]) -> u32 {
-    let k = position_lists.len();
-    if k == 0 {
-        return 0;
-    }
+pub struct BM25FParams {
+    pub k1:        f32,
+    pub w_title:   f32,
+    pub w_headers: f32,
+    pub w_code:    f32,
+    pub w_body:    f32,
+    pub b_title:   f32,
+    pub b_headers: f32,
+    pub b_code:    f32,
+    pub b_body:    f32,
+}
 
-    debug_assert!(k >= 2, "window_calc called with k < 2; should be skipped in rank_results");
-    for slice in position_lists {
-        debug_assert!(!slice.is_empty(), "window_calc called with empty position list");
-    }
-
-    let mut pointers = vec![0usize; k];
-    let mut best = u32::MAX;
-
-    loop {
-        let mut min = u32::MAX;
-        let mut max = 0u32;
-        let mut min_idx = 0usize;
-
-        for i in 0..k {
-            let v = position_lists[i][pointers[i]];
-            if v < min {
-                min = v;
-                min_idx = i;
-            }
-            if v > max {
-                max = v;
-            }
-        }
-
-        best = best.min(max - min + 1);
-
-        pointers[min_idx] += 1;
-        if pointers[min_idx] == position_lists[min_idx].len() {
-            return best;
+impl Default for BM25FParams {
+    fn default() -> Self {
+        BM25FParams {
+            k1:        1.2,
+            w_title:   5.0,
+            w_headers: 2.5,
+            w_code:    1.5,
+            w_body:    1.0,
+            b_title:   0.3,
+            b_headers: 0.5,
+            b_code:    0.7,
+            b_body:    0.75,
         }
     }
 }
-//a function to calculate ω (omega) - the smallest window in which all terms in user query exists and no of terms 
-//- put in a function and give a value to be used to boost a doc - which is later used in ranking
-//reason: we are replacing this strict doc selection - where all terms exists in exact order vs - finding relevant docs which
-//have terms dispersed
-pub fn omega_calc(terms: &Vec<String>, doc_id: u32, all_postings: &HashMap<String, HashMap<u32, Vec<u32>>>) -> u32 {
-    let position_lists: Vec<&[u32]> = terms.iter()
-        .filter_map(|term| all_postings.get(term)?.get(&doc_id).map(|v| v.as_slice()))
-        .collect();
-    
-    window_calc(&position_lists)
+
+// IDF component of BM25F
+pub fn bm25_idf(n: f32, df: f32) -> f32 {
+    ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
 }
-//boost calc - a function which takes omega - and returns a boost value which should be multiplied with tf_idf index 
-//- keeping it seperate because - it is subject to change in future
-pub fn boost_calc(k: usize, omega: u32) -> f32 {
-    1.0 + (k as f32 / omega as f32)
+
+// normalize a single field's tf for length — returns 0 if field is absent or corpus has no coverage
+pub fn normalize_field_tf(tf: f32, b: f32, dl: f32, avgdl: f32) -> f32 {
+    if tf == 0.0 || avgdl == 0.0 { return 0.0; }
+    tf / (1.0 - b + b * (dl / avgdl))
 }
-//a ranking function which uses tf - idf 
-pub fn rank_results(results: Vec<u32>, term_index: &HashMap<String, TermEntry>, terms: &Vec<String>, total_docs:f32, doc_vec_len: &HashMap<u32, f32>, tier_idx: usize) -> Vec<(u32, f32)> {
-    let no_of_terms = terms.len();
-    let n_results = results.len();
+
+// score one (term, doc) pair across all fields
+pub fn bm25f_score(
+    tf_title: f32, tf_headers: f32, tf_code: f32, tf_body: f32,
+    df: f32, n: f32,
+    doc_stats: &DocStats,
+    avg: &AvgLengths,
+    params: &BM25FParams,
+) -> f32 {
+    // no term frequency in any field — skip immediately
+    if tf_title == 0.0 && tf_headers == 0.0 && tf_code == 0.0 && tf_body == 0.0 {
+        return 0.0;
+    }
+
+    let idf = bm25_idf(n, df);
+
+    // normalize each field's tf for length, then apply field weight
+    let tilde_tf =
+        params.w_title   * normalize_field_tf(tf_title,   params.b_title,   doc_stats.len_title   as f32, avg.title)
+      + params.w_headers * normalize_field_tf(tf_headers, params.b_headers, doc_stats.len_headers as f32, avg.headers)
+      + params.w_code    * normalize_field_tf(tf_code,    params.b_code,    doc_stats.len_code    as f32, avg.code)
+      + params.w_body    * normalize_field_tf(tf_body,    params.b_body,    doc_stats.len_body    as f32, avg.body);
+
+    // BM25F closed form
+    idf * tilde_tf * (params.k1 + 1.0) / (tilde_tf + params.k1)
+}
+
+//a ranking function which uses BM25F — replaces old tf-idf + cosine normalization + omega boost
+pub fn rank_results(
+    candidates:  Vec<u32>,
+    query_terms: &Vec<String>,
+    term_index:  &HashMap<String, TermEntry>,
+    doc_stats:   &HashMap<u32, DocStats>,
+    avg_lengths: &AvgLengths,
+    params:      &BM25FParams,
+    total_docs:  f32,
+) -> Vec<(u32, f32)> {
+    let n_results = candidates.len();
 
     if VERBOSE {
-        println!("--- RANKING (tier {}) ---", tier_idx);
+        println!("--- RANKING (BM25F) ---");
         println!("  Candidate docs: {}", n_results);
-        println!("  Query terms: {} ({:?})", no_of_terms, terms);
+        println!("  Query terms: {} ({:?})", query_terms.len(), query_terms);
     }
 
+    // read postings once per query term — not per doc
     let t_postings = Instant::now();
-    let mut all_postings: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
-    //get all required postings for each term and store - only once we retrieve and deserialize
-    for term in terms {
-        let posting = read_postings(&term, term_index, tier_idx).unwrap();
-        all_postings.insert(term.clone(), posting);
+    let mut term_postings: HashMap<String, HashMap<u32, HashMap<Field, Vec<u32>>>> = HashMap::new();
+    for term in query_terms {
+        if let Some(postings) = read_postings(term, term_index) {
+            term_postings.insert(term.clone(), postings);
+        }
     }
     if VERBOSE {
-        println!("  Postings read for {} terms in {:?}", terms.len(), t_postings.elapsed());
+        println!("  Postings read for {} terms in {:?}", query_terms.len(), t_postings.elapsed());
     }
 
-    //now do the rest
-    //declare a variable to hold doc_id and final tf_idf score
     let t_score = Instant::now();
     let mut ranked_docs: Vec<(u32, f32)> = Vec::new();
 
-    // running stats — accumulated, printed once at the end
-    let mut sum_omega: u64 = 0;
-    let mut min_omega: u32 = u32::MAX;
-    let mut max_omega: u32 = 0;
-    let mut sum_boost: f32 = 0.0;
-    let mut docs_with_boost: usize = 0;
+    for doc_id in candidates {
+        let mut doc_score: f32 = 0.0;
 
-    for &doc_id in &results {
-        let mut doc_score:f32 = 0.0;
-        for term in terms {
-            let posting = &all_postings[term];
-            let t_f = posting[&doc_id].len() as f32;
-            let d_f = term_index[term].doc_freq as f32;
-            let score = tf_idf(t_f, total_docs, d_f);
-            doc_score += score;
-        }
-        //before pushing - once I am done for a doc_id all terms - divide by the vector length for 
-        //that doc_id which is already pre-computed and stored
-        doc_score /= doc_vec_len[&doc_id];
-        //omega - boost calc - normalization
-        let b = if no_of_terms >= 2 {
-            let omega = omega_calc(terms, doc_id , &all_postings);
-            if VERBOSE {
-                sum_omega += omega as u64;
-                if omega < min_omega { min_omega = omega; }
-                if omega > max_omega { max_omega = omega; }
-                docs_with_boost += 1;
-            }
-            let boost = boost_calc(no_of_terms, omega);
-            if VERBOSE {
-                sum_boost += boost;
-            }
-            boost
-        } else {
-            1.0
+        // get this doc's field lengths — if missing, skip (shouldn't happen)
+        let stats = match doc_stats.get(&doc_id) {
+            Some(s) => s,
+            None => continue,
         };
 
-        //multiply with boost
-        doc_score *= b;
+        for term in query_terms {
+            let df = match term_index.get(term) {
+                Some(entry) => entry.doc_freq as f32,
+                None => continue,
+            };
+
+            // if intersect_all is correct, every candidate doc has postings for every query term
+            let field_map = term_postings
+                .get(term)
+                .and_then(|p| p.get(&doc_id))
+                .expect("intersect_all returned a doc without postings for this term");
+
+            // extract tf per field — 0 if field absent for this term in this doc
+            let tf_title   = field_map.get(&Field::Title)  .map(|v| v.len() as f32).unwrap_or(0.0);
+            let tf_headers = field_map.get(&Field::Headers).map(|v| v.len() as f32).unwrap_or(0.0);
+            let tf_code    = field_map.get(&Field::Code)   .map(|v| v.len() as f32).unwrap_or(0.0);
+            let tf_body    = field_map.get(&Field::Body)   .map(|v| v.len() as f32).unwrap_or(0.0);
+
+            doc_score += bm25f_score(
+                tf_title, tf_headers, tf_code, tf_body,
+                df, total_docs,
+                stats,
+                avg_lengths,
+                params,
+            );
+        }
 
         ranked_docs.push((doc_id, doc_score));
     }
+
     if VERBOSE {
         println!("  Scoring loop ({} docs) in {:?}", n_results, t_score.elapsed());
-
-        if docs_with_boost > 0 {
-            let avg_omega = sum_omega as f32 / docs_with_boost as f32;
-            let avg_boost = sum_boost / docs_with_boost as f32;
-            println!("  Omega:  min={}  max={}  avg={:.2}", min_omega, max_omega, avg_omega);
-            println!("  Boost:  avg={:.3}  (1.0 = no effect, 2.0 = strict phrase match)", avg_boost);
-        } else {
-            println!("  Omega: skipped (single-term query, no proximity boost)");
-        }
     }
 
-    //sort them before giving the result
+    // sort descending by score
     let t_sort = Instant::now();
-    ranked_docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    ranked_docs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
     if VERBOSE {
         println!("  Sort time: {:?}", t_sort.elapsed());
-
         println!("  Top 5 preview:");
         for (i, (doc_id, score)) in ranked_docs.iter().take(5).enumerate() {
             println!("    {}. doc_id={}  score={:.4}", i + 1, doc_id, score);
@@ -193,6 +196,5 @@ pub fn rank_results(results: Vec<u32>, term_index: &HashMap<String, TermEntry>, 
         println!();
     }
 
-    //final result
     ranked_docs
 }

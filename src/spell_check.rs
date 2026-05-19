@@ -151,7 +151,8 @@ mod tests {
 
     fn dummy_entry(freq: u32) -> TermEntry {
         TermEntry {
-            tiers: [(0, 0); 3],
+            offset: 0,
+            length: 0,
             doc_freq: freq,
         }
     }
