@@ -1,63 +1,94 @@
 # Search Engine in Rust
 
-A search engine being built from scratch in Rust, following Manning's *Introduction to Information Retrieval* textbook chapter by chapter. No Lucene, no Elasticsearch, no libraries doing the interesting work. Indexing, compression, spell correction, ranking, tiered retrieval, proximity scoring — all written by hand.
+A search engine built from scratch in Rust. No Lucene, no Elasticsearch, no libraries doing the interesting work. Indexing, compression, spell correction, BM25F scoring, field extraction, CamelCase tokenization — all written by hand.
 
-Currently indexes 11,314 documents from the 20 Newsgroups dataset. Returns ranked, proximity-boosted results with spell correction in single-digit milliseconds for most queries.
+Started as a chapter-by-chapter walk through Manning's *Introduction to Information Retrieval* on the 20 Newsgroups toy corpus. Pivoted in May 2026 to a real corpus: **AWS documentation** (14,266 markdown files across 18 services). Same math, real users — developers searching `s3:GetObject`, `arn:aws:iam`, `t2.micro`, and the typos those queries pick up along the way.
 
 ## What it does
 
 ```
 Enter your search query:
-united states of america
+RunInstances
 
-→ TIER 0: 2 candidates after intersection
-→ Doc 9059 (1,835 lines, firearms archive): tf-idf score 0.0926
-→ Doc 8802 (13 lines, Cold War post): not yet scored
-→ TIER 1: 0 candidates
-→ TIER 2: 1 new candidate (doc 8802)
-→ Doc 8802 has the literal phrase "United States of America" in line 1
-→ ω = 4 (smallest window containing all 4 terms)
-→ Boost: 1 + 4/4 = 2.0
-→ Doc 8802 final score: 0.6723
+→ Spell check: runinstances (no correction needed)
+→ Postings retrieved (62 docs in 1.9ms)
+→ Intersection: 62 candidates
+→ BM25F scoring (4 fields: title, headers, code, body)
+→ Top result: API_RunInstances.md (score 10.40)
+  Reference doc for the EC2 RunInstances API operation.
+→ Total query time: 3.4 ms
+```
 
-Top result:  doc 8802 — score 0.6723  (13-line focused post, ω=4)
-Second:      doc 9059 — score 0.1581  (1,835-line archive, ω=40, terms scattered)
+```
+Enter your search query:
+arn:aws:s3
 
-Ratio: 4.25x. Proximity scoring amplified the cosine-norm finding.
-Total query time: 49.6 ms.
+→ Tokenizer preserves the ARN intact
+→ 205 matching docs
+→ Top result: AmazonS3/.../batch-ops-iam-role-policies.md
+→ Total query time: 6.1 ms
+```
+
+```
+Enter your search query:
+permssion
+
+→ Spell check: permssion → permission (1,734 docs)
+→ Top result: AWSEC2/.../API_CreateNetworkInterfacePermission.md
+→ Total query time: 13.4 ms
 ```
 
 ## Architecture
 
-**Index construction.** Documents are processed in blocks of 4,000. Each block is flushed to disk when memory fills, then all blocks are merged via a streaming k-way merge into a single contiguous index file. Dictionary stays in RAM, postings live on disk.
+**Index construction.** Documents are processed in blocks of 4,000 using SPIMI (Single-Pass In-Memory Indexing). Each block is flushed to disk when memory fills, then merged via a streaming k-way merge into a single contiguous index file. Dictionary stays in RAM; postings live on disk.
 
-**Custom serialization.** No bincode. Hand-rolled VByte encoder/decoder that gap-encodes sorted doc IDs and positions. Index size dropped from 34.8MB to 8.3MB — 76% reduction. Six serialization call sites, ~40 lines of Rust.
+**Custom serialization.** No bincode. Hand-rolled VByte encoder that gap-encodes sorted doc IDs and positions. Six serialization call sites, ~40 lines of Rust, ~76% reduction in index size on the toy corpus.
 
-**Tiered indexes.** Each term's posting list partitioned by term frequency into three tiers (T1 = high-tf docs, T2 = medium, T3 = low). Single-pass partition during merge — three jobs (doc_freq, tier split, doc_vec_len contribution) ride one pass over the assembled merged_postings with zero clones. Thresholds tuned from the 1.7M-pair tf distribution: T1=5, T2=2, putting 4% of postings in tier 1 and 9% in tier 2.
+**Field-keyed posting format.** Postings are nested four deep: `{term → doc_id → field → positions}`. Position gaps reset per field, doc-id gaps persist globally, empty fields cost zero bytes. The `Field` enum uses `#[repr(u8)]` for free serialization and exhaustive matching in the scorer.
 
-**Tier-fallback retrieval.** Query runs against tier 1 first. If results < K, fall back to tier 2; still < K, fall back to tier 3. Cross-tier dedup via HashSet. Final sort across all tiers — load-bearing, not defensive: a tier-2 short doc can outscore a tier-0 long doc once cosine normalization divides by document length.
+**Field extraction.** `field_extract.rs` parses raw markdown into four field strings:
+- **title** — first H1
+- **headers** — all H2/H3/H4 concatenated
+- **code** — fenced blocks + inline spans
+- **body** — everything else
 
-**Spell correction.** Trigram index → Jaccard similarity filter → Levenshtein edit distance ranking. Handles multiple misspelled words in a single query.
+Bold/italic markdown emphasis is stripped from non-code fields before tokenization. Code field stays raw because `*` carries meaning there (IAM wildcards, glob patterns).
 
-**TF-IDF ranking with cosine normalization.** Document vector lengths precomputed at index time. Query-time score: sum of tf × idf across query terms, divided by precomputed length. Rewards topical focus over document length.
+**Tokenizer.** AWS-aware keep list (`. - _ : / ' @ *`) preserves tokens like `s3:GetObject`, `arn:aws:s3:::my-bucket`, `t2.micro`, `us-east-1`, `s3:Get*`. Asymmetric edge trimming so `cause:` trims to `cause` but `s3:Get*` keeps its wildcard. Curly quotes and Latin ligatures normalize to ASCII. ASCII-only alphanumerics so footnote superscripts like `¹` don't contaminate tokens.
 
-**Query-term proximity scoring (Ch 7.2.2).** For each candidate doc, compute ω = the smallest window containing at least one position from each query term. ω is computed in O(total positions) via a k-pointer min-advance scan. The doc's score is then multiplied by `1 + k/ω`, where k = number of query terms. ω = k recovers strict phrase matching as the special case where boost = 2.0. Single-term queries skip the boost via a `k >= 2` guard.
+**CamelCase + underscore splitting.** Every compound token is split into pieces and indexed at the same position as the original:
+
+```
+RunInstances        → runinstances, run, instances
+API_RunInstances    → api_runinstances, api, runinstances, run, instances
+getXMLData          → getxmldata, get, xml, data
+```
+
+Two boundary rules: lowercase-or-digit → uppercase (`RunInstances` at `n→I`), and uppercase → uppercase-lowercase (`XMLData` at `L→D`, preserves acronyms).
+
+**Spell correction.** Trigram index → doc-frequency filter → Jaccard similarity filter → Levenshtein edit distance ranking. Sorts on `(edit_distance ASC, doc_freq DESC)` so `instnace` resolves to `instance` (~5,000 docs) instead of `instace` (1 doc).
+
+**BM25F ranking.** Field-aware scoring with per-field length normalization and global IDF. Field weighting happens inside the pseudo-tf calculation so BM25's saturation curve applies once across the doc, not per field:
+
+```
+IDF(t)      = ln(1 + (N − df + 0.5) / (df + 0.5))
+norm_tf_f   = tf_f / (1 − b_f + b_f · dl_f / avgdl_f)
+tilde_tf    = Σ_f  w_f · norm_tf_f
+score(t,d)  = IDF(t) · tilde_tf · (k₁ + 1) / (tilde_tf + k₁)
+```
+
+Default field weights: title 3.0, headers 2.0, code 1.5, body 1.0. Per-field `b` values: 0.3 / 0.5 / 0.7 / 0.75 (lower `b` for title because titles are short and uniform; higher `b` for body because bodies are long and variable).
 
 ## Query pipeline
 
 ```
 user query
-  → spell correction (trigram + Jaccard + edit distance)
-  → for tier in 0..3:
-       → postings retrieval from disk (seek by offset, read exact bytes per tier)
-       → sorted intersection (smallest posting list first)
-       → cross-tier dedup
-       → for each candidate doc:
-              → tf-idf score using corpus-wide doc_freq from term_index
-              → cosine normalization (divide by precomputed doc_vec_len)
-              → proximity boost: doc_score *= 1 + k / window_calc(positions)
-       → if cumulative results >= K, break
-  → final sort across all tiers (load-bearing — handles cross-tier ranking inversions)
+  → spell correction (trigram → doc-freq filter → Jaccard → Levenshtein)
+  → for each term: read posting list from disk (one seek + read per term)
+  → sorted intersection across all term postings (smallest list first)
+  → for each candidate doc:
+        → BM25F score using global IDF + per-field tf/dl/avgdl + field weights
+  → sort descending by score
   → top-K results with file paths
 ```
 
@@ -65,87 +96,78 @@ user query
 
 ```
 src/
-├── main.rs              — orchestration, query loop, tier-fallback loop
-├── traverse.rs           — recursive document ingestion
-├── cleanup.rs            — tokenization (alphanumeric, lowercase)
-├── encode_decode.rs      — VByte encoding/decoding, serialization
-├── block_merge.rs        — BSBI streaming k-way merge, single-pass tier partition,
-│                            doc_vec_len precomputation, TermEntry construction
-├── get_posting.rs        — per-tier disk reads by offset
-├── intersect.rs          — two-pointer sorted intersection, smallest-first ordering
-├── spell_check.rs        — trigram + Jaccard + Levenshtein pipeline
+├── main.rs              — orchestration, query loop
+├── traverse.rs           — recursive document ingestion, SPIMI block flushes
+├── field_extract.rs      — regex-driven markdown → 4 field strings
+├── cleanup.rs            — tokenization, CamelCase + underscore splitting
+├── encode_decode.rs      — VByte + gap encoding, field-keyed serialization,
+│                            Field enum (#[repr(u8)])
+├── block_merge.rs        — streaming k-way merge, single contiguous index file,
+│                            TermEntry construction
+├── get_posting.rs        — disk reads by offset
+├── intersect.rs          — two-pointer sorted intersection, smallest-first
+├── spell_check.rs        — trigram + doc-freq filter + Jaccard + Levenshtein
 ├── three_gram_index.rs   — trigram index construction
-├── tf_idf_index.rs       — tf-idf, cosine norm, omega_calc, window_calc,
-│                            boost_calc, rank_results
-├── phrase_check.rs       — retired (mod declaration removed from main.rs);
-│                            kept on disk as historical reference. Strict phrase
-│                            matching is now the ω = k special case of proximity scoring.
+├── tf_idf_index.rs       — BM25F scoring (legacy filename retained)
+└── phrase_check.rs       — retired (kept on disk as historical reference)
 ```
-
-## Chapters implemented
-
-| Ch    | Topic                              | What was built                                                                 |
-|-------|------------------------------------|--------------------------------------------------------------------------------|
-| 1     | Boolean retrieval                  | Inverted index, postings intersection                                          |
-| 2     | Vocabulary and postings            | Positional index, phrase queries                                               |
-| 3     | Tolerant retrieval                 | Trigram index, spell correction, edit distance                                 |
-| 4     | Index construction                 | Block-based construction, streaming k-way merge, RAM dictionary                |
-| 5     | Index compression                  | VByte encoding, gap encoding, custom serialization (76% smaller)               |
-| 6     | Scoring and ranking                | tf-idf, cosine normalization, precomputed doc lengths                          |
-| 7.2.1 | Tiered indexes                     | Histogram-tuned thresholds, single-pass tier partition, tier-fallback loop     |
-| 7.2.2 | Query-term proximity               | ω computation via k-pointer min-advance, multiplicative boost `1 + k/ω`        |
-
-**Skipped intentionally:** 7.1.3 (champion lists — generalized by tiered indexes), 7.1.6 (cluster pruning — out of modern lineage), 7.2.3 / 7.2.4 / 7.3 / 7.4 (synthesis sections, not in trajectory).
-
-**Deferred:** 7.1.5 (impact ordering) — composes with BM25 as the scoring function, implement after Ch 11.
 
 ## Performance
 
-**Index:** 11,314 documents, 138,743 unique terms, 8.3MB compressed index on disk. Tier 1 holds 4% of postings, tier 2 holds 9%, tier 3 holds 87%.
+**Index** (AWS docs corpus, 14,266 documents, 18 services):
 
-**Query latency** on the 12-query regression suite (debug build):
+| Metric              | Value           |
+|---------------------|-----------------|
+| Indexing time       | ~150 seconds    |
+| Merge time          | ~17 seconds     |
+| Unique terms        | ~180,000        |
+| `final_index.bin`   | ~30 MB          |
 
-| Query type                         | Latency        | Notes                                              |
-|------------------------------------|----------------|----------------------------------------------------|
-| Single-term (`israeli`, `nasa`)    | 1.3 – 3.9 ms   | Tier 0 alone fills K=10                            |
-| Multi-term phrase (`gun control`)  | 4.4 – 5.7 ms   | Tier 0 ω=2, boost=2.0                              |
-| Multi-term scattered               | 4.0 – 9.4 ms   | Falls through to tier 2, smaller boost             |
-| 4-term with stop word              | **49.6 ms**    | Reading "of" posting list (60KB, 3,231 docs)       |
+**Query latency** across the 13-query golden set:
 
-The 49.6 ms outlier on `united states of america` is driven entirely by reading the posting list for "of." That term contributes near-zero to ranking (idf ≈ 0.12) but pays full I/O cost. BM25's aggressive idf weighting will let stop-word skipping become safe — filed for the next release.
+| Query type                           | Latency        |
+|--------------------------------------|----------------|
+| Single rare term (`RunInstances`)    | 3 – 5 ms       |
+| Single common term (`s3`)            | ~45 ms         |
+| 2-term phrase (`vpc peering`)        | ~25 ms         |
+| 3-term query (`iam policy syntax`)   | 50 – 70 ms     |
+| Typo correction (`permssion`)        | 13 ms total    |
 
-**Ranking quality.** On the 20 Newsgroups corpus, the engine demonstrates that **tf-idf + cosine normalization + tiered fallback + proximity scoring compound** to surface focused short documents over long documents that mention query terms in passing:
+**Golden set quality.** On a 13-query qualitative test set ranging from navigational (`RunInstances`, `vpc peering`) to conceptual (`lambda cold start`) to high-frequency (`s3`, `bucket policy permissions`) to typos (`permssion`):
 
-```
-Query: "united states of america"
-Doc 8802 (13 lines, "Cold War: Who REALLY Won?")  →  score 0.6723   (rank 1)
-Doc 9059 (1,835 lines, firearms archive)           →  score 0.1581   (rank 2)
-Ratio: 4.25x
-```
+| Result        | Count |
+|---------------|-------|
+| A / A+        | 6     |
+| B / C+        | 5     |
+| Failures left | 2     |
 
-Pre-proximity (Release 0.6), the same ratio was 2.3x via cosine normalization alone. Adding proximity scoring nearly doubled the gap because doc 8802 contains the literal phrase tightly (ω=4) and doc 9059 has the same words scattered across hundreds of positions (ω=40).
+Failures are now diagnosable — the math is explicit, per-field, and exposable. The two remaining failures hit BM25F's structural ceiling: bag-of-words scoring can't distinguish "this doc is *about* the term" from "this doc mentions the term twenty times."
 
-## Recovery on multi-word queries
+## Articles
 
-Release 0.6 used a strict phrase filter that killed valid AND-matches when query terms didn't appear in literal word order. Five queries on the test suite returned zero results despite having 13–22 candidate documents.
+Each release is documented in long form on [krithik.xyz](https://krithik.xyz):
 
-Release 0.7 (proximity scoring) replaces that binary filter with a continuous boost. Result on the canonical case:
+**Foundation series** (20 Newsgroups corpus):
+1. Inverted positional index + two-pointer intersection
+2. Phrase search + spell correction
+3. Reading from disk
+4. VByte compression
+5. TF-IDF + cosine normalization
+6. Tiered indexes
+7. Proximity scoring
 
-```
-Query: "israeli palestinian"
-Release 0.6:  22 candidates, 0 returned (phrase filter killed all)
-Release 0.7:  22 candidates, 10 returned (all from talk.politics.mideast,
-                                          ranked correctly, top hit doc 359)
-```
-
-All five previously-zero queries recover under proximity scoring.
+**Real corpus series** (AWS documentation):
+8. Why I'm changing course: from the Manning book to AWS docs
+9. The AWS corpus, the tokenizer, and the spell corrector
+10. Killing tiers to make room for BM25F
+11. Fields: extracting structure from AWS markdown for BM25F
+12. CamelCase tokenization and the BM25F ceiling
 
 ## What's next
 
-- **Cranfield benchmark** (1,398 docs, 225 expert-judged queries since the 1960s). Replace 12-query qualitative tests with MAP / P@10 / NDCG@10 against real relevance judgments.
-- **BM25 (Ch 11.4.3).** Replaces tf-idf + cosine norm with one formula. Better tf saturation, better length normalization. Cuts the stop-word latency problem.
-- **Threshold experiment.** (3, 1) vs (5, 2) on the regression suite.
-- **Then production lineage:** impact-ordered postings → WAND → block-max WAND → dense retrieval / hybrid search.
+- **PageRank from the cross-link graph.** AWS docs cross-link extensively; pages with high inbound link count are more authoritative. The graph is already implicit from the scraper's Pass 2.
+- **Evaluation harness.** 30+ hand-judged queries with relevance labels. P@1, P@10, MAP, NDCG. The 13-query golden set was a placeholder.
+- **HTTP server + demo.** axum, Cloudflare-fronted demo, walkthrough video.
 
 ## Build and run
 
@@ -154,16 +176,8 @@ cargo build --release
 cargo run --release
 ```
 
-Expects the 20 Newsgroups training set at the path specified in `main.rs`. Update the `root` variable to point to your local copy.
+Expects the AWS docs corpus at the path specified in `main.rs`. Update the `root` variable to point to your local copy.
 
-## Articles
+## License
 
-Each release is documented in long form on [krithik.xyz](https://krithik.xyz):
-
-1. Inverted positional index + two-pointer intersection
-2. Phrase search + spell correction
-3. Reading from disk
-4. VByte compression
-5. TF-IDF + cosine normalization
-6. Tiered indexes
-7. Proximity scoring
+Code is open source. Articles on [krithik.xyz](https://krithik.xyz) describe what each piece does and why.
