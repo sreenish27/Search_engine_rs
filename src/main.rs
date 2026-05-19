@@ -40,7 +40,9 @@ fn main() {
 
     println!("--- INDEX CONSTRUCTION ---");
     let t = Instant::now();
-    traverse(root, &mut index_map, &mut doc_id, &mut doc_map, &mut gram_index);
+    if let Err(e) = traverse(root, &mut index_map, &mut doc_id, &mut doc_map, &mut gram_index) {
+        eprintln!("Traversal failed: {}", e);
+    }
     //to process the remaining docs that didn't hit the 4000 block checkpoint
     if !index_map.is_empty() {
         let encoded = serialize_block(&index_map);

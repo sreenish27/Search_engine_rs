@@ -10,27 +10,31 @@ use crate::cleanup::{read_contents, split_string};
 //recursively traverses through a folder to get to all the files
 //gets each file's path and processes the file contents into the inverted index
 //added two vairables to capture document length and - average document length (to help with BM25 calculations)
-pub fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>, doc_id: &mut u32, doc_map: &mut HashMap<u32, String>, gram_index: &mut BTreeMap<String, Vec<String>>) {
-    let entries = fs::read_dir(path).unwrap();
+pub fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32>>>, doc_id: &mut u32, doc_map: &mut HashMap<u32, String>, gram_index: &mut BTreeMap<String, Vec<String>>) -> Result<(), std::io::Error> {
+    let entries = fs::read_dir(path)?;
     for entry in entries {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            traverse(entry.path().to_str().unwrap(), index_map, doc_id, doc_map, gram_index);
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            traverse(entry.path().to_str().ok_or(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 path"))?, index_map, doc_id, doc_map, gram_index)?;
         } else {
+            //reducing the number of times i am calling the entry piece - to reduce the Pathbuf object allocation from 2 to 1
+            let path_str = entry.path().to_str()
+    .ok_or(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 path"))?
+    .to_string();
             //block-based processing - every 4000 docs, write current index to disk in binary format and clear memory
             if *doc_id > 0 && *doc_id % 4000 == 0 {
                 println!("  Writing block {} to disk, clearing memory", *doc_id / 4000);
                 let encoded = serialize_block(&index_map);
                 let filename = format!("block_{}.bin", *doc_id / 4000);
-                let mut file = File::create(&filename).unwrap();
-                file.write_all(&encoded).unwrap();
+                let mut file = File::create(&filename)?;
+                file.write_all(&encoded)?;
                 //once written then clear index_map to free memory
                 index_map.clear();
             }
             *doc_id += 1;
             //creating a map for docIDs and location of the files
-            doc_map.insert(*doc_id, entry.path().to_str().unwrap().to_string());
-            let file_content = read_contents(entry.path().to_str().unwrap());
+            doc_map.insert(*doc_id, path_str.clone());
+            let file_content = read_contents(&path_str);
             let terms: Vec<String> = split_string(file_content);
             // //code to insert doc length to the hashmap
             // doc_lengths.insert(*doc_id, terms.len() as u32);
@@ -44,4 +48,6 @@ pub fn traverse(path: &str, index_map: &mut HashMap<String, HashMap<u32, Vec<u32
             }
         }
     }
+
+    Ok(())
 }
